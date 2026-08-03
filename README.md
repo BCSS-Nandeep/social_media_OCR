@@ -352,6 +352,13 @@ Digits, years and embedded English (`1605`, `1611`, `Easy`, `Kick`,
 > **Caveat on method.** Ground truth is a human transcription of the images.
 > For hand-lettered posters that transcription is itself uncertain, so those
 > per-image figures carry real error bars.
+>
+> **The reference files are not in this repo**, and neither are the poster
+> images they describe — both were removed as the working image set changed.
+> The figures above are therefore reported results, not something a clone can
+> re-derive as-is. To reproduce or extend them, put images in `data/input/` and
+> write a matching `data/ground_truth/<image stem>.txt` for each, then run
+> `evaluate.py`. The scorer itself is in the repo and unchanged.
 
 ---
 
@@ -489,7 +496,8 @@ output at 0.39, which is the honest answer.
 | [src/exporter.py](src/exporter.py) | `OCRResult` + TXT/JSON/CSV writers |
 | [src/visualize.py](src/visualize.py) | Annotated debug overlay |
 | [tests/test_pipeline.py](tests/test_pipeline.py) | Offline tests (PaddleOCR stubbed) |
-| [data/ground_truth/](data/ground_truth/) | Hand-written reference text for scoring |
+| `data/input/` | Your images (git-ignored) |
+| `data/ground_truth/` | Optional `<image stem>.txt` references for `evaluate.py`; create your own |
 
 The engine wrapper accepts **both** PaddleOCR APIs — 2.x `.ocr(img, cls=True)`
 returning nested lists, and 3.x `.predict(img)` returning result dicts. It
