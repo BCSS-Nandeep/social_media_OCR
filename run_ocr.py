@@ -62,8 +62,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--legacy-det", action="store_true",
                    help="Use PaddleOCR's own lang-default detector (PP-OCRv5) "
                         "instead of PP-OCRv6.")
-    p.add_argument("--no-angle-cls", action="store_true",
-                   help="Disable the 180-degree text-line angle classifier.")
+    # Default OFF. The textline orientation classifier is trained on document
+    # scans; on poster art it misfires badly and rotates upright lines 180
+    # degrees, after which recognition returns garbage. Measured on the
+    # ground-truth set it cost 17 points of document accuracy overall and 35
+    # on the worst image. Detection is unaffected -- block counts are identical
+    # either way, so the damage is purely to the crops fed to recognition.
+    p.add_argument("--angle-cls", action="store_true",
+                   help="Enable the 180-degree text-line orientation classifier. "
+                        "Off by default: it misfires on poster text and cost 17 "
+                        "points of accuracy on the sample set. Turn on only for "
+                        "images with genuinely upside-down text.")
     p.add_argument("--gpu", action="store_true", help="Use GPU (needs paddlepaddle-gpu).")
     p.add_argument("--visualize", action="store_true",
                    help="Also write an annotated image with boxes and confidences.")
@@ -125,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     print("Loading PaddleOCR models (first run downloads them)...")
 
     engine = OCREngine(langs, use_gpu=args.gpu,
-                       use_angle_cls=not args.no_angle_cls,
+                       use_angle_cls=args.angle_cls,
                        det_db_box_thresh=args.det_box_thresh,
                        det_limit_side_len=args.det_limit,
                        det_db_unclip_ratio=args.unclip,

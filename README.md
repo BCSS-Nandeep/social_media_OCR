@@ -151,7 +151,7 @@ processing time per image.
 | `--det-box-thresh` | `0.5` | Lower ⇒ detects more/fainter text, more false positives. |
 | `--det-limit` | `960` | Max side the detector sees (larger images downscaled first). |
 | `--unclip` | `1.5` | Detected-box inflation before recognition cropping. |
-| `--no-angle-cls` | off | Skip the 180° text-line orientation classifier. |
+| `--angle-cls` | off | Enable the 180° orientation classifier. **Off by default — it cost 17 points of accuracy on the sample set.** Turn on only for genuinely rotated text. |
 | `--gpu` | off | Requires `paddlepaddle-gpu` instead of `paddlepaddle`. |
 | `--visualize` | off | Write `outputs/overlays/<name>_boxes.png` — boxes coloured green ≥0.90, amber ≥0.70, red below. |
 | `--resize` | off | Scale short side to ≥`--min-side` (960), long side ≤`--max-side` (2560). |
@@ -184,29 +184,68 @@ reference characters, CPU, no preprocessing.
 
 ### Headline numbers
 
-Current pipeline: **PP-OCRv6 detector + PP-OCRv5 Telugu recogniser**, `--lang te`.
+Current pipeline: **PP-OCRv6 detector + PP-OCRv5 Telugu recogniser**,
+`--lang te`, orientation classifier off.
 
 | Metric | Score |
 |---|---|
-| **Document character accuracy** | **68.0%** |
-| Telugu character accuracy | 69.4% |
-| **Word accuracy** (whole word exactly right) | **51.1%** |
-| Line accuracy (order-independent) | 53.0% |
-| Speed | ~4.5 s / image (CPU) |
+| **Telugu character accuracy** | **92.2%** |
+| **Document character accuracy** | **84.9%** |
+| Line accuracy (order-independent) | 75.8% |
+| **Word accuracy** (whole word exactly right) | **65.5%** |
+| Speed | ~5 s / image (CPU) |
 
-### How it got there — two changes, both measured
+### How it got there — three changes, all measured
 
-| Stage | Doc accuracy | Word accuracy |
-|---|---|---|
-| PaddleOCR 2.9.1, PP-OCRv3-era Telugu model | 51.2% | 16.4% |
-| PaddleOCR 3.7 + `te_PP-OCRv5_mobile_rec` | 59.5% | — |
-| **+ PP-OCRv6 detector** | **68.0%** | **51.1%** |
+| Stage | Doc accuracy | Telugu | Word |
+|---|---|---|---|
+| PaddleOCR 2.9.1, PP-OCRv3-era Telugu model | 51.2% | 45.3% | 16.4% |
+| PaddleOCR 3.7 + `te_PP-OCRv5_mobile_rec` | 59.5% | — | — |
+| + PP-OCRv6 detector | 68.0% | 69.4% | 51.1% |
+| **+ orientation classifier disabled** | **84.9%** | **92.2%** | **65.5%** |
 
-Word accuracy — the number that decides whether output is usable — **tripled**,
-from 16.4% to 51.1%.
+Word accuracy — the number that decides whether output is usable — went from
+16.4% to 65.5%, a **4× improvement**.
 
 Note what did *not* work: 16 preprocessing configurations moved accuracy by
-less than 3% each. Both real gains came from **changing models**.
+less than 3% each. Every real gain came from **model choice and pipeline
+configuration**, not from filtering pixels.
+
+### The orientation classifier was destroying text
+
+The single largest win, and the least obvious. PaddleOCR's textline
+orientation classifier (`PP-LCNet_x1_0_textline_ori`) decides whether each
+detected line is upside-down and rotates it 180° if it thinks so. It is
+trained on document scans. On poster art — decorative fonts, coloured
+backgrounds, text over photographs — **it misfires and flips upright lines**,
+after which recognition returns garbage.
+
+The tell was in the digits. A quiz line reading `1605 … 1611` came out as:
+
+```
+QeSe g  O gా 119L ' g gూ G091 L
+```
+
+`1611` → `119L`, `1605` → `G091` — those are rotated digits, not
+misrecognised ones.
+
+Disabling it, with everything else unchanged:
+
+| Poster | With classifier | Without | Δ |
+|---|---:|---:|---:|
+| Quiz meme | 61.7% | **96.9%** | **+35.2** |
+| Genius notes (2/7) | 34.7% | **79.8%** | **+45.1** |
+| Hand-lettered songs poster | 72.0% | **81.7%** | +9.7 |
+| Instagram G-7 quiz | 94.1% | **96.7%** | +2.6 |
+| TSLPRB police notice | 72.8% | **74.6%** | +1.8 |
+| Genius cover | 75.0% | 75.0% | 0.0 |
+| **Overall** | **68.0%** | **84.9%** | **+16.9** |
+
+**Block counts are identical either way** — detection was never the problem on
+these two posters. The classifier was handing the recogniser upside-down crops.
+
+Six of six images improved or held, so it is off by default. `--angle-cls`
+turns it back on for images with genuinely rotated text.
 
 ### The PP-OCRv6 detector swap
 
@@ -265,16 +304,17 @@ for English-dominant images.
 
 | Poster | Doc | Telugu | Word | Confidence |
 |---|---:|---:|---:|---:|
-| Instagram G-7 quiz | **94.1%** | 98.7% | 79.0% | 0.883 |
+| Quiz meme | **96.9%** | 99.1% | 86.8% | 0.903 |
+| Instagram G-7 quiz | **96.7%** | 98.7% | 81.0% | 0.931 |
+| Hand-lettered songs poster | 81.7% | 82.8% | 59.4% | 0.937 |
+| Genius notes (2/7) | 79.8% | 86.7% | 50.0% | 0.880 |
 | Genius cover | 75.0% | 81.6% | 47.8% | 0.890 |
-| TSLPRB police notice | 72.8% | 84.8% | 59.1% | 0.732 |
-| Hand-lettered songs poster | 72.0% | 71.9% | 56.2% | 0.865 |
-| Quiz meme | 61.7% | 56.5% | 48.7% | 0.803 |
-| Genius notes (2/7) | **34.7%** | 25.8% | 17.9% | 0.697 |
+| TSLPRB police notice | 74.6% | 96.9% | 62.1% | 0.897 |
 
-The Genius notes page remains the hard case: a dense multi-card layout whose
-decorative headline makes the recogniser hallucinate Latin
-(`C A SOINE NROUN PUBLICATIONS`).
+Telugu character accuracy is now above 96% on three of six posters. The
+remaining document-level gap on the police notice is layout, not recognition —
+its Telugu is 96.9% but two-column label/value rows interleave in reading
+order.
 
 ### What still fails
 
@@ -296,16 +336,18 @@ Digits, years and embedded English (`1605`, `1611`, `Easy`, `Kick`,
    correctly even on busy poster art, and the v6 detector made this markedly
    better.
 2. **English and numeric content is production-quality.**
-3. **Telugu is good on clean layouts, weak on dense decorative ones.** The
-   spread is wide — 94% on a clean quiz screenshot, 35% on a dense notes page.
-   At ~68% overall, output still needs human review before use.
+3. **Telugu recognition is now strong — 92.2% at character level**, above 96%
+   on half the sample. The remaining document-level gap is mostly *layout*
+   (reading order on multi-column cards), not character recognition.
 4. **Confidence tracks quality at the image level** and is a usable triage
    signal — but *not* per block: `Contact:` was read as `Contact.` at 0.997.
    Low confidence reliably flags trouble; high confidence guarantees nothing.
-5. Preprocessing is exhausted as a lever; **model choice is where the gains
-   were.** Beyond this, the next steps are per-crop rescaling before
-   recognition, a VLM fallback for low-confidence blocks, or a fine-tuned
-   Telugu recogniser.
+5. Preprocessing was exhausted as a lever early and never paid. **Every gain
+   came from model choice and from switching off a stage that was actively
+   corrupting input.** Worth remembering: the largest single win came from
+   *disabling* a feature, not adding one.
+6. The next bottleneck is **reading order on multi-column layouts**, not
+   recognition — see Known limits.
 
 > **Caveat on method.** Ground truth is a human transcription of the images.
 > For hand-lettered posters that transcription is itself uncertain, so those
@@ -460,9 +502,10 @@ while quietly discarding the settings they carry.
 
 ## Tests
 
-23 tests covering preprocessing, coordinate mapping, reading order, the
-multi-pass merge (including the word-inside-line case), both result-parser
-formats, and all three exporters. PaddleOCR is stubbed, so they run without it:
+28 tests covering preprocessing, coordinate mapping, reading order, the
+multi-pass merge (including the word-inside-line case), detector/recogniser
+pairing, both result-parser formats, and all three exporters. PaddleOCR is
+stubbed, so they run without it:
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -t . -v
@@ -472,7 +515,7 @@ formats, and all three exporters. PaddleOCR is stubbed, so they run without it:
 
 ## Known limits
 
-- **Telugu accuracy (~68%, 51% word).** Conjunct consonants (ఒత్తులు) fail systematically
+- **Telugu accuracy (92% character, 66% word).** Conjunct consonants (ఒత్తులు) still fail sometimes
   and hand-lettered display type is unreliable. Treat blocks below ~0.7 as
   needing review — that is what `--min-confidence` and the overlay colours are
   for. Headline-quality Telugu needs a fine-tuned recognition model.
@@ -480,5 +523,8 @@ formats, and all three exporters. PaddleOCR is stubbed, so they run without it:
   correct read.
 - **Stylised type.** Heavy outlines, gradients, arced/curved text and text baked
   into photographs degrade detection. `--det-box-thresh 0.3` recovers some.
-- **Multi-column posters** interleave (see Reading order).
+- **Multi-column posters interleave — this is now the main bottleneck.** The
+  TSLPRB notice recognises Telugu at 96.9% but scores only 74.6% at document
+  level, because its label/value rows are read straight across instead of as
+  columns. Fixing reading order is worth more than further recognition work.
 - **Emoji and pictographs** are not in any recognition dictionary and are dropped.
