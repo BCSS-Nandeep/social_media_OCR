@@ -1,0 +1,16 @@
+# PaddleOCR poster-OCR pipeline
+# NOTE: PaddlePaddle publishes wheels for CPython 3.8 - 3.12 only.
+#       Install these into a Python 3.12 (or 3.10/3.11) virtual environment.
+
+paddlepaddle==3.2.0          # 3.0.0 can't load PP-OCRv5 models ("strides" error);
+                             # 3.3.1 hits a PIR executor bug on Windows CPU
+                             # ("ConvertPirAttribute2RuntimeAttribute"). 3.2.0 works.
+paddleocr>=3.7,<4            # ships te_PP-OCRv5_mobile_rec: measured +10 accuracy
+                             # points over the 2.x-era Telugu model on this repo's
+                             # ground-truth set (see README, Evaluation results)
+
+pandas<3                     # paddlex imports pandas; pandas 3.x DLLs are blocked
+                             # by this machine's Application Control policy
+setuptools                   # paddle.utils.cpp_extension imports it; absent from py3.12 venvs
+opencv-python>=4.10,<5
+Pillow>=10.0
