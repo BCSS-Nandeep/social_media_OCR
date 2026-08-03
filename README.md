@@ -24,9 +24,6 @@ py -3.12 -m venv .venv
 
 # 2. drop poster images into data/input/, then run
 .\.venv\Scripts\python.exe run_ocr.py data\input --formats txt json csv
-
-# 3. score against ground truth (optional)
-.\.venv\Scripts\python.exe evaluate.py
 ```
 
 Results land in `outputs/`. First run downloads ~100 MB of models.
@@ -178,9 +175,9 @@ is why the upgrade below mattered and the filters did not.
 
 ## Accuracy
 
-Measured with [evaluate.py](evaluate.py) against hand-written ground truth in
-[data/ground_truth/](data/ground_truth/) — six real Instagram posters, 2,826
-reference characters, CPU, no preprocessing.
+Measured by character-level edit distance against hand-written transcriptions
+of six real Instagram posters — 2,826 reference characters, CPU, no
+preprocessing. These numbers are what drove the configuration defaults below.
 
 ### Headline numbers
 
@@ -353,12 +350,11 @@ Digits, years and embedded English (`1605`, `1611`, `Easy`, `Kick`,
 > For hand-lettered posters that transcription is itself uncertain, so those
 > per-image figures carry real error bars.
 >
-> **The reference files are not in this repo**, and neither are the poster
-> images they describe — both were removed as the working image set changed.
-> The figures above are therefore reported results, not something a clone can
-> re-derive as-is. To reproduce or extend them, put images in `data/input/` and
-> write a matching `data/ground_truth/<image stem>.txt` for each, then run
-> `evaluate.py`. The scorer itself is in the repo and unchanged.
+> **Neither the reference transcriptions nor the poster images are in this
+> repo** — both were removed as the working image set changed, along with the
+> scoring script. The figures above are therefore reported results, not
+> something a clone can re-derive as-is. Reproducing them would mean
+> transcribing a set of posters by hand and re-scoring against it.
 
 ---
 
@@ -488,7 +484,6 @@ output at 0.39, which is the honest answer.
 | Path | Role |
 |---|---|
 | [run_ocr.py](run_ocr.py) | CLI, batch loop, console reporting |
-| [evaluate.py](evaluate.py) | CER/WER scoring against ground truth |
 | [src/pipeline.py](src/pipeline.py) | One image end-to-end, stage timing |
 | [src/preprocess.py](src/preprocess.py) | Optional image stages, non-ASCII-safe loading |
 | [src/ocr_engine.py](src/ocr_engine.py) | PaddleOCR wrapper, `TextBlock`, multi-pass merge |
@@ -497,7 +492,7 @@ output at 0.39, which is the honest answer.
 | [src/visualize.py](src/visualize.py) | Annotated debug overlay |
 | [tests/test_pipeline.py](tests/test_pipeline.py) | Offline tests (PaddleOCR stubbed) |
 | `data/input/` | Your images (git-ignored) |
-| `data/ground_truth/` | Optional `<image stem>.txt` references for `evaluate.py`; create your own |
+| `outputs/` | Generated results (git-ignored) |
 
 The engine wrapper accepts **both** PaddleOCR APIs — 2.x `.ocr(img, cls=True)`
 returning nested lists, and 3.x `.predict(img)` returning result dicts. It
