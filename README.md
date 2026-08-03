@@ -104,8 +104,11 @@ processing time per image.
 # one specific image
 .\.venv\Scripts\python.exe run_ocr.py data\input\poster.jpg
 
-# Telugu only — 3x faster than te+en, and only ~1 accuracy point worse
-.\.venv\Scripts\python.exe run_ocr.py data\input --lang te
+# both scripts — only for English-dominant images (3.7x slower, no measured gain)
+.\.venv\Scripts\python.exe run_ocr.py data\input --lang te+en
+
+# fall back to the older v5 detector
+.\.venv\Scripts\python.exe run_ocr.py data\input --legacy-det
 
 # also write CSV, and an annotated image showing every detected box
 .\.venv\Scripts\python.exe run_ocr.py data\input --formats txt json csv --visualize
@@ -140,7 +143,9 @@ processing time per image.
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--lang` | `te+en` | `'+'`-separated recognition passes. `te`, `en`, or both. |
+| `--lang` | `te` | `'+'`-separated recognition passes. `te`, `en`, or both. `te+en` measured no better than `te` alone and takes 3.7× longer. |
+| `--det-model` | `PP-OCRv6_medium_det` | Detection model name. |
+| `--legacy-det` | off | Use PaddleOCR's lang-default v5 detector instead of v6. |
 | `--formats` | `txt json` | Any of `txt`, `json`, `csv`. |
 | `--min-confidence` | `0.0` | Drop blocks scoring below this; the count is reported. Default keeps everything, including reads PaddleOCR would normally hide (see [Confidence reporting](#confidence-reporting)). |
 | `--det-box-thresh` | `0.5` | Lower ⇒ detects more/fainter text, more false positives. |
@@ -177,45 +182,99 @@ Measured with [evaluate.py](evaluate.py) against hand-written ground truth in
 [data/ground_truth/](data/ground_truth/) — six real Instagram posters, 2,826
 reference characters, CPU, no preprocessing.
 
-### Headline numbers (PaddleOCR 3.7 + PP-OCRv5 Telugu)
+### Headline numbers
+
+Current pipeline: **PP-OCRv6 detector + PP-OCRv5 Telugu recogniser**, `--lang te`.
 
 | Metric | Score |
 |---|---|
-| **Document character accuracy** | **60.9%** |
-| Line accuracy (order-independent) | 40.7% |
+| **Document character accuracy** | **68.0%** |
+| Telugu character accuracy | 69.4% |
+| **Word accuracy** (whole word exactly right) | **51.1%** |
+| Line accuracy (order-independent) | 53.0% |
+| Speed | ~4.5 s / image (CPU) |
 
-### The model upgrade that produced it
+### How it got there — two changes, both measured
 
-The pipeline originally used PaddleOCR 2.9.1. Moving to **PaddleOCR 3.7 with
-the `te_PP-OCRv5_mobile_rec` model** was the single change that actually moved
-accuracy — nearly **+10 points** where 16 preprocessing configurations moved
-nothing:
-
-| Poster | 2.9.1 (old) | 3.7 PP-OCRv5 (now) | Δ |
-|---|---|---|---|
-| Instagram quiz (1) | 56.3% | **80.7%** | +24.4 |
-| Genius cover | 48.2% | **73.0%** | +24.8 |
-| Quiz meme | 60.0% | **70.1%** | +10.1 |
-| Hand-lettered songs poster | 28.0% | **54.3%** | +26.3 |
-| TSLPRB police notice | 48.8% | **56.5%** | +7.7 |
-| Genius notes (2/7) | 50.0% | **28.6%** | **−21.4** |
-| **Overall (char-weighted)** | **51.2%** | **60.9%** | **+9.7** |
-
-**One poster regressed and it is worth knowing why.** On the "Genius notes"
-page the v5 model hallucinates Latin letters across the decorative headline
-(`C A SOINE NROUN PUBLICATIONS UXIUJHO`) where the old model produced
-wrong-but-Telugu output. Five of six posters improved, most by 10–26 points;
-one got materially worse.
-
-### `--lang te` is nearly as good and 3× faster
-
-| Mode | Document accuracy | Time / image |
+| Stage | Doc accuracy | Word accuracy |
 |---|---|---|
-| `te+en` (default) | 60.9% | ~14.6 s |
-| `te` only | 59.5% | ~5.2 s |
+| PaddleOCR 2.9.1, PP-OCRv3-era Telugu model | 51.2% | 16.4% |
+| PaddleOCR 3.7 + `te_PP-OCRv5_mobile_rec` | 59.5% | — |
+| **+ PP-OCRv6 detector** | **68.0%** | **51.1%** |
 
-For 1.4 accuracy points, the second recognition pass costs roughly 3× the
-runtime. **Use `--lang te` for batch work** unless a poster is English-heavy.
+Word accuracy — the number that decides whether output is usable — **tripled**,
+from 16.4% to 51.1%.
+
+Note what did *not* work: 16 preprocessing configurations moved accuracy by
+less than 3% each. Both real gains came from **changing models**.
+
+### The PP-OCRv6 detector swap
+
+PP-OCRv6 (PaddleOCR 3.7, June 2026) has **no Telugu recogniser** — it covers
+Chinese, English, Japanese and Latin-script languages only:
+
+```python
+_PPOCRV6_LANGS = frozenset({"ch", "chinese_cht", "en", "japan"}) | LATIN_LANGS
+```
+
+But **detection is script-agnostic**, so the v6 detector can front the v5
+Telugu recogniser. Detector comparison, everything else held constant:
+
+| Detector | Doc accuracy | Speed |
+|---|---|---|
+| `PP-OCRv5_server_det` (stock) | 59.5% | 5.9 s/img |
+| **`PP-OCRv6_medium_det`** | **68.0%** | **3.8 s/img** |
+| `PP-OCRv6_small_det` | 58.3% | 1.8 s/img |
+
+Medium wins on accuracy *and* speed. The mechanism is visible in the box
+counts — it stops shattering text into fragments, so the recogniser sees whole
+lines instead of shards:
+
+| Poster | Boxes before | Boxes after | Doc accuracy |
+|---|---:|---:|---|
+| TSLPRB police notice | 57 | **28** | 55.3% → **72.8%** |
+| Genius notes (2/7) | 58 | **43** | 25.6% → **34.7%** |
+| Hand-lettered songs poster | 22 | **15** | 54.3% → **72.0%** |
+| Instagram G-7 quiz | 33 | **23** | 82.1% → **94.1%** |
+| Genius cover | 27 | **22** | 67.8% → **75.0%** |
+| Quiz meme | 17 | 16 | 70.1% → **61.7%** |
+
+Five of six improved, by 7–18 points. The quiz meme lost 8: the v6 detector
+actually reads *more* of its lines correctly (`రాష్ట్రపతి`, `పార్లమెంట్`,
+`అడిగినప్పుడే` are all fixed) but drops one answer line entirely — a localised
+detection dropout, not a systematic regression.
+
+> **Naming a detector makes PaddleOCR ignore `lang`.** The recogniser must be
+> named in the same call or it silently falls back to the Chinese default and
+> returns confident nonsense for Telugu. `RECOGNITION_MODELS` in
+> [src/ocr_engine.py](src/ocr_engine.py) keeps the pair together, and tests
+> guard it — the failure mode is silent, not loud.
+
+### `--lang te` is the default now
+
+| Mode | Doc accuracy | Time / image |
+|---|---|---|
+| **`te` (default)** | **68.0%** | **3.8 s** |
+| `te+en` | 68.1% | 13.9 s |
+
+With the v6 detector the second English pass buys **0.1 points for 3.7× the
+runtime** — the Telugu model already reads embedded English. Use `te+en` only
+for English-dominant images.
+
+### Per-image results
+
+| Poster | Doc | Telugu | Word | Confidence |
+|---|---:|---:|---:|---:|
+| Instagram G-7 quiz | **94.1%** | 98.7% | 79.0% | 0.883 |
+| Genius cover | 75.0% | 81.6% | 47.8% | 0.890 |
+| TSLPRB police notice | 72.8% | 84.8% | 59.1% | 0.732 |
+| Hand-lettered songs poster | 72.0% | 71.9% | 56.2% | 0.865 |
+| Quiz meme | 61.7% | 56.5% | 48.7% | 0.803 |
+| Genius notes (2/7) | **34.7%** | 25.8% | 17.9% | 0.697 |
+
+The Genius notes page remains the hard case: a dense multi-card layout whose
+decorative headline makes the recogniser hallucinate Latin
+(`C A SOINE NROUN PUBLICATIONS`).
 
 ### What still fails
 
@@ -234,15 +293,19 @@ Digits, years and embedded English (`1605`, `1611`, `Easy`, `Kick`,
 ### Conclusions for the stated objective
 
 1. **Detection and reading order are solid** — regions are found and ordered
-   correctly even on busy poster art.
+   correctly even on busy poster art, and the v6 detector made this markedly
+   better.
 2. **English and numeric content is production-quality.**
-3. **Telugu is usable for plain body text, unreliable for stylised display
-   type.** At ~61% character accuracy, output needs human review before use.
+3. **Telugu is good on clean layouts, weak on dense decorative ones.** The
+   spread is wide — 94% on a clean quiz screenshot, 35% on a dense notes page.
+   At ~68% overall, output still needs human review before use.
 4. **Confidence tracks quality at the image level** and is a usable triage
    signal — but *not* per block: `Contact:` was read as `Contact.` at 0.997.
    Low confidence reliably flags trouble; high confidence guarantees nothing.
-5. Further gains require a **fine-tuned Telugu recognition model**, not
-   configuration changes.
+5. Preprocessing is exhausted as a lever; **model choice is where the gains
+   were.** Beyond this, the next steps are per-crop rescaling before
+   recognition, a VLM fallback for low-confidence blocks, or a fine-tuned
+   Telugu recogniser.
 
 > **Caveat on method.** Ground truth is a human transcription of the images.
 > For hand-lettered posters that transcription is itself uncertain, so those
@@ -258,7 +321,7 @@ version combinations fail on Windows CPU:
 | Package | Pin | Reason |
 |---|---|---|
 | `paddlepaddle` | `==3.2.0` | 3.0.0 cannot load PP-OCRv5 models (`Type of attribute: strides is not right`). 3.3.1 hits a PIR executor bug (`ConvertPirAttribute2RuntimeAttribute not support`). 3.2.0 is the working middle. |
-| `paddleocr` | `>=3.7,<4` | Ships `te_PP-OCRv5_mobile_rec`, worth ~+10 accuracy points over the 2.x Telugu model. |
+| `paddleocr` | `>=3.7,<4` | Ships both `te_PP-OCRv5_mobile_rec` (+8 points over the 2.x Telugu model) and the PP-OCRv6 detectors (+8.5 more). |
 | `pandas` | `<3` | `paddlex` imports pandas; pandas 3.x ships DLLs blocked by some corporate Application Control policies. |
 
 `matplotlib` is deliberately **not** installed — `paddlex` imports it only for
@@ -409,7 +472,7 @@ formats, and all three exporters. PaddleOCR is stubbed, so they run without it:
 
 ## Known limits
 
-- **Telugu accuracy (~61%).** Conjunct consonants (ఒత్తులు) fail systematically
+- **Telugu accuracy (~68%, 51% word).** Conjunct consonants (ఒత్తులు) fail systematically
   and hand-lettered display type is unreliable. Treat blocks below ~0.7 as
   needing review — that is what `--min-confidence` and the overlay colours are
   for. Headline-quality Telugu needs a fine-tuned recognition model.

@@ -33,9 +33,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Image file, or a directory of images (searched recursively).")
     p.add_argument("-o", "--output-dir", type=Path, default=ROOT / "outputs",
                    help="Where to write results (default: ./outputs).")
-    p.add_argument("--lang", default="te+en",
-                   help="Recognition language(s), '+'-separated. "
-                        "'te'=Telugu, 'en'=English, 'te+en'=both passes merged (default).")
+    p.add_argument("--lang", default="te",
+                   help="Recognition language(s), '+'-separated. 'te'=Telugu "
+                        "(default), 'en'=English, 'te+en'=both passes merged. "
+                        "The Telugu model reads embedded English too, so 'te+en' "
+                        "measured no better than 'te' alone while taking ~3.7x "
+                        "longer -- use it only for English-dominant images.")
     p.add_argument("--formats", nargs="+", default=["txt", "json"],
                    choices=["txt", "json", "csv"],
                    help="Export formats (default: txt json).")
@@ -49,6 +52,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "downscaled to this before detection. Default 960 (PaddleOCR's own).")
     p.add_argument("--unclip", type=float, default=1.5,
                    help="Box inflation before recognition cropping. Default 1.5.")
+    p.add_argument("--det-model", default=None, metavar="NAME",
+                   help="Detection model name. Default PP-OCRv6_medium_det "
+                        "(+8.5 accuracy points and faster than the stock v5 "
+                        "detector).")
+    # A dedicated flag rather than `--det-model ""`: PowerShell drops empty
+    # string arguments before the process sees them, so the quoted-empty form
+    # silently turns into a parse error on the shell most users are on.
+    p.add_argument("--legacy-det", action="store_true",
+                   help="Use PaddleOCR's own lang-default detector (PP-OCRv5) "
+                        "instead of PP-OCRv6.")
     p.add_argument("--no-angle-cls", action="store_true",
                    help="Disable the 180-degree text-line angle classifier.")
     p.add_argument("--gpu", action="store_true", help="Use GPU (needs paddlepaddle-gpu).")
@@ -116,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
                        det_db_box_thresh=args.det_box_thresh,
                        det_limit_side_len=args.det_limit,
                        det_db_unclip_ratio=args.unclip,
+                       det_model="" if args.legacy_det else args.det_model,
                        drop_score=0.0)  # filter once, in process_image, so the
                                         # "dropped" count reflects reality
     engine.warmup()

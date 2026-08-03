@@ -20,6 +20,30 @@ from typing import Any, Sequence
 import numpy as np
 
 
+# PP-OCRv6 (PaddleOCR 3.7, June 2026) covers Chinese, English, Japanese and the
+# Latin-script languages -- there is NO Telugu recogniser for it, and none is
+# planned in that set. Detection, however, is script-agnostic, so the v6
+# detector can front the v5 Telugu recogniser.
+#
+# Measured on the six-poster ground-truth set, swapping only the detector:
+#     PP-OCRv5_server_det (stock)  59.5% document accuracy, 5.9 s/image
+#     PP-OCRv6_medium_det          68.0% document accuracy, 3.8 s/image
+#     PP-OCRv6_small_det           58.3% document accuracy, 1.8 s/image
+# Medium wins on accuracy *and* speed: it fragments far less (one poster went
+# from 57 boxes to 28), so the recogniser sees whole lines instead of shards.
+DETECTION_MODEL = "PP-OCRv6_medium_det"
+
+# Recognition model per language. A language absent here falls back to
+# PaddleOCR's own lang-based resolution.
+RECOGNITION_MODELS = {
+    "te": "te_PP-OCRv5_mobile_rec",   # newest Telugu model that exists
+    "en": "PP-OCRv6_medium_rec",
+    "ch": "PP-OCRv6_medium_rec",
+    "japan": "PP-OCRv6_medium_rec",
+    "chinese_cht": "PP-OCRv6_medium_rec",
+}
+
+
 def _major_version(module: Any) -> int:
     """Leading integer of ``module.__version__``; 2 if it cannot be read."""
     raw = str(getattr(module, "__version__", "2")).split(".")[0]
@@ -88,7 +112,7 @@ class OCREngine:
     def __init__(self, langs: Sequence[str], use_gpu: bool = False,
                  use_angle_cls: bool = True, det_db_box_thresh: float = 0.5,
                  drop_score: float = 0.0, det_limit_side_len: int = 960,
-                 det_db_unclip_ratio: float = 1.5,
+                 det_db_unclip_ratio: float = 1.5, det_model: str | None = None,
                  paddle_extra: dict[str, Any] | None = None):
         self.langs = list(langs)
         self.use_gpu = use_gpu
@@ -99,14 +123,15 @@ class OCREngine:
         # would make the reported block count and confidence stats silently
         # incomplete. Default it to 0 and let --min-confidence be the only filter.
         self.drop_score = drop_score
-        # Detection-resolution cap and box-inflation ratio, exposed because
-        # they are the obvious levers for small/clipped Telugu marks. Measured
-        # on the six-poster ground-truth set, though, neither moved accuracy
-        # outside +/-3% noise (det 960/1600/2400 x unclip 1.5/2.0/2.5, plus
-        # score_mode/dilation) -- so the defaults stay at PaddleOCR's own.
-        # The bottleneck is the Telugu recognition model, not detection.
+        # Detection-resolution cap and box-inflation ratio. Measured on the
+        # six-poster ground-truth set, neither moved accuracy outside +/-3%
+        # noise (det 960/1600/2400 x unclip 1.5/2.0/2.5, plus score_mode and
+        # dilation), so the defaults stay at PaddleOCR's own. Swapping the
+        # *detector model* is what actually helped -- see DETECTION_MODEL.
         self.det_limit_side_len = det_limit_side_len
         self.det_db_unclip_ratio = det_db_unclip_ratio
+        # None -> use DETECTION_MODEL; "" -> let PaddleOCR resolve from lang.
+        self.det_model = DETECTION_MODEL if det_model is None else det_model
         # Version-specific extras passed straight to the PaddleOCR constructor
         # (e.g. det_db_score_mode="slow"). The caller owns name correctness.
         self.paddle_extra = dict(paddle_extra or {})
@@ -143,6 +168,15 @@ class OCREngine:
                 "text_det_limit_side_len": self.det_limit_side_len,
                 "text_det_unclip_ratio": self.det_db_unclip_ratio,
             }
+            # Naming an explicit detector makes PaddleOCR ignore `lang`
+            # entirely, so the recogniser has to be named too or it silently
+            # falls back to the Chinese default. Only override when we know
+            # both halves; otherwise leave lang-based resolution alone.
+            rec_model = RECOGNITION_MODELS.get(lang)
+            if self.det_model and rec_model:
+                kwargs.pop("lang")
+                kwargs["text_detection_model_name"] = self.det_model
+                kwargs["text_recognition_model_name"] = rec_model
         else:
             kwargs = {
                 "lang": lang,

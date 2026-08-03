@@ -9,8 +9,10 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import cv2
 import numpy as np
@@ -18,7 +20,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.exporter import OCRResult, export, write_batch_summary          # noqa: E402
-from src.ocr_engine import OCREngine, TextBlock, merge_by_overlap        # noqa: E402
+from src.ocr_engine import (DETECTION_MODEL, RECOGNITION_MODELS,         # noqa: E402
+                            OCREngine, TextBlock, merge_by_overlap)
 from src.pipeline import process_image                                   # noqa: E402
 from src.preprocess import (PreprocessConfig, enhance_contrast,          # noqa: E402
                             fix_orientation, load_image, resize_for_ocr)
@@ -129,6 +132,58 @@ class ParserTests(unittest.TestCase):
     def test_empty_page_is_not_an_error(self):
         self.assertEqual(OCREngine._parse_v2([None], "en"), [])
         self.assertEqual(OCREngine._parse_v3([], "en"), [])
+
+
+class ModelSelectionTests(unittest.TestCase):
+    """Guard the det/rec pairing -- its failure mode is silent, not loud.
+
+    Naming a detection model makes PaddleOCR ignore `lang`. If the recognition
+    model is not named in the same breath, it quietly falls back to the Chinese
+    default and returns confident nonsense for Telugu.
+    """
+
+    def kwargs_for(self, lang, **engine_kwargs):
+        engine = OCREngine([lang], **engine_kwargs)
+        engine._api = "v3"
+        captured = {}
+
+        class FakePaddleOCR:
+            def __init__(self, **kw):
+                captured.update(kw)
+
+        module = types.ModuleType("paddleocr")
+        module.__version__ = "3.7.0"
+        module.PaddleOCR = FakePaddleOCR
+        with mock.patch.dict(sys.modules, {"paddleocr": module}):
+            engine._build(lang)
+        return captured
+
+    def test_detector_and_recogniser_are_always_named_together(self):
+        kw = self.kwargs_for("te")
+        self.assertEqual(kw["text_detection_model_name"], DETECTION_MODEL)
+        self.assertEqual(kw["text_recognition_model_name"],
+                         RECOGNITION_MODELS["te"])
+        self.assertNotIn("lang", kw)  # would be ignored anyway; do not imply otherwise
+
+    def test_unmapped_language_keeps_paddleocr_lang_resolution(self):
+        kw = self.kwargs_for("arabic")
+        self.assertEqual(kw["lang"], "arabic")
+        self.assertNotIn("text_detection_model_name", kw)
+        self.assertNotIn("text_recognition_model_name", kw)
+
+    def test_empty_det_model_opts_out_of_the_override(self):
+        kw = self.kwargs_for("te", det_model="")
+        self.assertEqual(kw["lang"], "te")
+        self.assertNotIn("text_detection_model_name", kw)
+
+    def test_explicit_det_model_is_honoured(self):
+        kw = self.kwargs_for("te", det_model="PP-OCRv6_small_det")
+        self.assertEqual(kw["text_detection_model_name"], "PP-OCRv6_small_det")
+
+    def test_telugu_recogniser_is_not_a_v6_model(self):
+        # PP-OCRv6 has no Telugu recogniser; pointing `te` at one would produce
+        # confident garbage rather than an error.
+        self.assertNotIn("v6", RECOGNITION_MODELS["te"])
 
 
 class PreprocessTests(unittest.TestCase):
