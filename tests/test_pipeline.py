@@ -19,6 +19,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.detect_script import (PROBE_HEIGHT, ScriptDetector,             # noqa: E402
+                               margin, warp_crop)
 from src.exporter import OCRResult, export, write_batch_summary          # noqa: E402
 from src.ocr_engine import (DETECTION_MODEL, RECOGNITION_MODELS,         # noqa: E402
                             OCREngine, TextBlock, merge_by_overlap)
@@ -26,6 +28,9 @@ from src.pipeline import process_image                                   # noqa:
 from src.preprocess import (PreprocessConfig, enhance_contrast,          # noqa: E402
                             fix_orientation, load_image, resize_for_ocr)
 from src.reading_order import group_into_lines, order_blocks, render_text  # noqa: E402
+from src.scripts import (AUTO_DETECT_SCRIPTS, LANGUAGE_SCRIPTS,          # noqa: E402
+                         SCRIPT_MODELS, UNSUPPORTED_SCRIPTS,
+                         UnsupportedLanguage, resolve_models, resolve_script)
 
 TELUGU = "శుభాకాంక్షలు"
 
@@ -134,6 +139,196 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(OCREngine._parse_v3([], "en"), [])
 
 
+class ScriptRoutingTests(unittest.TestCase):
+    """Indian-language routing. Getting a script wrong is silent, not loud:
+    a Devanagari model pointed at Telugu returns confident nonsense."""
+
+    def test_languages_collapse_to_shared_script_passes(self):
+        # Four languages, one Devanagari model -> one recognition pass.
+        pairs = resolve_models(["hi", "mr", "ne", "sa"])
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0][0], "devanagari")
+
+    def test_distinct_scripts_each_get_a_pass_in_order(self):
+        pairs = resolve_models(["hi", "te", "en"])
+        self.assertEqual([s for s, _ in pairs], ["devanagari", "telugu", "latin"])
+
+    def test_duplicate_request_does_not_duplicate_the_pass(self):
+        self.assertEqual(len(resolve_models(["hi", "hindi", "mr"])), 1)
+
+    def test_unsupported_indian_language_fails_loudly(self):
+        for code in ("bn", "ml", "gu", "pa", "or", "as"):
+            with self.assertRaises(UnsupportedLanguage) as ctx:
+                resolve_script(code)
+            # The message must name the language and list alternatives, since
+            # the user cannot otherwise tell "unsupported" from "typo".
+            self.assertIn(UNSUPPORTED_SCRIPTS[code].split(" (")[0], str(ctx.exception))
+
+    def test_unsupported_never_silently_falls_back_to_another_script(self):
+        for code in UNSUPPORTED_SCRIPTS:
+            self.assertNotIn(code, LANGUAGE_SCRIPTS,
+                             f"{code} must not resolve to a script model")
+
+    def test_unknown_code_is_rejected(self):
+        with self.assertRaises(UnsupportedLanguage):
+            resolve_script("klingon")
+
+    def test_aliases_and_case_are_accepted(self):
+        self.assertEqual(resolve_script("Hindi"), "devanagari")
+        self.assertEqual(resolve_script(" TELUGU "), "telugu")
+
+    def test_script_names_pass_through(self):
+        self.assertEqual(resolve_script("devanagari"), "devanagari")
+
+    def test_every_script_has_a_model_and_every_model_is_registered(self):
+        for script in set(LANGUAGE_SCRIPTS.values()):
+            self.assertIn(script, SCRIPT_MODELS)
+        for script, model in SCRIPT_MODELS.items():
+            self.assertEqual(RECOGNITION_MODELS[script], model)
+
+    def test_legacy_codes_still_resolve(self):
+        # 'te' and 'en' were the original pass keys; existing commands and
+        # saved JSON refer to them.
+        self.assertEqual(RECOGNITION_MODELS["te"], SCRIPT_MODELS["telugu"])
+        self.assertEqual(RECOGNITION_MODELS["en"], SCRIPT_MODELS["latin"])
+
+
+class AutoDetectTests(unittest.TestCase):
+    """Script auto-detection.
+
+    The two defects guarded here both showed up only at runtime: holding every
+    script's pipeline at once crashed the process with an access violation, and
+    re-probing every image made a batch several times slower than it needed to be.
+    """
+
+    def make_engine(self, verdicts, **kw):
+        """Engine whose detector returns `verdicts` in order, one per image."""
+        engine = OCREngine(list(AUTO_DETECT_SCRIPTS), auto_mode=True, **kw)
+        engine.ran: list[str] = []
+        pending = list(verdicts)
+
+        class FakeDetector:
+            def detect(self, image):
+                script = pending.pop(0)
+                if script is None:
+                    return None, {}
+                scores = {s: 0.40 for s in AUTO_DETECT_SCRIPTS}
+                scores[script] = 0.95
+                return script, scores
+
+        engine._detector = FakeDetector()
+
+        def fake_run_single(image, lang):
+            engine.ran.append(lang)
+            engine._models.setdefault(lang, object())
+            return [TextBlock(f"{lang}-text", 0.9,
+                              [[0, 0], [100, 0], [100, 30], [0, 30]], lang)]
+
+        engine._run_single = fake_run_single
+        return engine
+
+    def test_uses_the_detected_script(self):
+        engine = self.make_engine(["devanagari"])
+        engine.run(np.zeros((80, 200, 3), np.uint8))
+        self.assertEqual(engine.detected_langs, ["devanagari"])
+        self.assertEqual(engine.ran, ["devanagari"])
+
+    def test_detects_every_image_not_just_the_first(self):
+        # The bug this pins: probing once and reusing the winner read three
+        # Hindi posters with the Telugu model and returned confident noise.
+        engine = self.make_engine(["telugu", "devanagari", "devanagari"])
+        blank = np.zeros((80, 200, 3), np.uint8)
+        for _ in range(3):
+            engine.run(blank)
+        self.assertEqual(engine.ran, ["telugu", "devanagari", "devanagari"])
+
+    def test_switching_script_releases_the_previous_pipeline(self):
+        # Six resident PaddleOCR pipelines segfault the process, so a mixed
+        # batch must not accumulate one per language it encounters.
+        engine = self.make_engine(["telugu", "devanagari", "tamil"])
+        blank = np.zeros((80, 200, 3), np.uint8)
+        for _ in range(3):
+            engine.run(blank)
+        self.assertLessEqual(len(engine._models), 1,
+                             f"pipelines left resident: {sorted(engine._models)}")
+
+    def test_repeated_script_is_not_reloaded(self):
+        engine = self.make_engine(["telugu", "telugu"])
+        blank = np.zeros((80, 200, 3), np.uint8)
+        engine.run(blank)
+        engine.run(blank)
+        self.assertEqual(list(engine._models), ["telugu"])
+
+    def test_probe_time_is_reported_separately(self):
+        engine = self.make_engine(["telugu"])
+        _, per_lang = engine.run(np.zeros((80, 200, 3), np.uint8))
+        self.assertIn("script-probe", per_lang)
+
+    def test_undetectable_image_falls_back_to_latin(self):
+        engine = self.make_engine([None])
+        engine.run(np.zeros((80, 200, 3), np.uint8))
+        self.assertEqual(engine.detected_langs, ["latin"])
+
+    def test_latin_merge_is_opt_in(self):
+        blank = np.zeros((80, 200, 3), np.uint8)
+        plain = self.make_engine(["telugu"])
+        plain.run(blank)
+        self.assertEqual(plain.detected_langs, ["telugu"])
+
+        merging = self.make_engine(["telugu"], auto_merge_latin=True)
+        merging.run(blank)
+        self.assertEqual(merging.detected_langs, ["telugu", "latin"])
+
+    def test_explicit_mode_does_not_detect(self):
+        engine = OCREngine(["telugu"])
+        self.assertFalse(engine.auto_mode)
+        self.assertIsNone(engine._auto_choice)
+
+
+class ScriptDetectorTests(unittest.TestCase):
+    def test_margin_reports_gap_between_top_two(self):
+        self.assertAlmostEqual(margin({"a": 0.9, "b": 0.7, "c": 0.1}), 0.2)
+        self.assertEqual(margin({"a": 0.9}), 1.0)
+        self.assertEqual(margin({}), 1.0)
+
+    def test_warp_crop_rectifies_and_caps_height(self):
+        image = np.full((400, 400, 3), 255, np.uint8)
+        crop = warp_crop(image, [[10, 10], [310, 10], [310, 210], [10, 210]])
+        self.assertIsNotNone(crop)
+        self.assertLessEqual(crop.shape[0], PROBE_HEIGHT)
+
+    def test_warp_crop_rejects_degenerate_boxes(self):
+        image = np.full((100, 100, 3), 255, np.uint8)
+        self.assertIsNone(warp_crop(image, [[0, 0], [3, 0], [3, 3], [0, 3]]))
+        self.assertIsNone(warp_crop(image, [[0, 0], [9, 0], [9, 9]]))
+
+    def test_score_weights_by_text_length(self):
+        detector = ScriptDetector("det", {"a": "m1", "b": "m2"})
+
+        class Rec:
+            def __init__(self, text, score):
+                self.out = {"rec_text": text, "rec_score": score}
+
+            def predict(self, crops):
+                return [self.out for _ in crops]
+
+        # 'a' is confident on two characters; 'b' slightly less so on twenty.
+        detector._recs = {"a": Rec("xx", 1.0), "b": Rec("x" * 20, 0.8)}
+        scores = detector.score([np.zeros((8, 8, 3), np.uint8)])
+        self.assertAlmostEqual(scores["a"], 1.0)
+        self.assertAlmostEqual(scores["b"], 0.8)
+
+    def test_score_survives_a_broken_recogniser(self):
+        detector = ScriptDetector("det", {"bad": "m"})
+
+        class Boom:
+            def predict(self, crops):
+                raise RuntimeError("model exploded")
+
+        detector._recs = {"bad": Boom()}
+        self.assertEqual(detector.score([np.zeros((8, 8, 3), np.uint8)]), {"bad": 0.0})
+
+
 class ModelSelectionTests(unittest.TestCase):
     """Guard the det/rec pairing -- its failure mode is silent, not loud.
 
@@ -166,8 +361,11 @@ class ModelSelectionTests(unittest.TestCase):
         self.assertNotIn("lang", kw)  # would be ignored anyway; do not imply otherwise
 
     def test_unmapped_language_keeps_paddleocr_lang_resolution(self):
-        kw = self.kwargs_for("arabic")
-        self.assertEqual(kw["lang"], "arabic")
+        # 'korean' is a real PaddleOCR language but outside this pipeline's
+        # registry, so it must fall through to lang-based resolution intact.
+        self.assertNotIn("korean", RECOGNITION_MODELS)
+        kw = self.kwargs_for("korean")
+        self.assertEqual(kw["lang"], "korean")
         self.assertNotIn("text_detection_model_name", kw)
         self.assertNotIn("text_recognition_model_name", kw)
 

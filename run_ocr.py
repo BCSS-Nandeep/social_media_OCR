@@ -11,14 +11,26 @@ Examples
 from __future__ import annotations
 
 import argparse
+import io
 import sys
 import traceback
 from pathlib import Path
 
+# Windows consoles default to cp1252, which cannot encode Devanagari, Telugu,
+# etc.  Force UTF-8 so print() never raises UnicodeEncodeError.
+if sys.stdout.encoding != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+if sys.stderr.encoding != "utf-8":
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
+from src.detect_script import CONFIDENT_MARGIN, margin
 from src.exporter import OCRResult, export, write_batch_summary
 from src.ocr_engine import OCREngine
 from src.pipeline import find_images, process_image
 from src.preprocess import PreprocessConfig
+from src.scripts import (AUTO_DETECT_SCRIPTS, KNOWN_WEAK, LANGUAGE_SCRIPTS,
+                         UNSUPPORTED_SCRIPTS, UnsupportedLanguage,
+                         resolve_models)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -29,16 +41,25 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("input", type=Path,
+    # Optional so --list-languages can run on its own; checked in main().
+    p.add_argument("input", type=Path, nargs="?",
                    help="Image file, or a directory of images (searched recursively).")
     p.add_argument("-o", "--output-dir", type=Path, default=ROOT / "outputs",
                    help="Where to write results (default: ./outputs).")
-    p.add_argument("--lang", default="te",
-                   help="Recognition language(s), '+'-separated. 'te'=Telugu "
-                        "(default), 'en'=English, 'te+en'=both passes merged. "
-                        "The Telugu model reads embedded English too, so 'te+en' "
-                        "measured no better than 'te' alone while taking ~3.7x "
-                        "longer -- use it only for English-dominant images.")
+    p.add_argument("--lang", default="auto",
+                   help="Language(s), '+'-separated: te, hi, ta, kn, mr, ur, en, "
+                        "sa, ne, gom, ks, sd ... or 'auto' to detect the script "
+                        "automatically per image (default). Languages sharing a "
+                        "script share one pass, so 'hi+mr+ne' costs the same as "
+                        "'hi'. Each additional *script* roughly doubles runtime. "
+                        "See --list-languages.")
+    p.add_argument("--list-languages", action="store_true",
+                   help="Print supported languages and their scripts, then exit.")
+    p.add_argument("--auto-merge-latin", action="store_true",
+                   help="In auto mode, also run a Latin pass and merge it. "
+                        "Doubles runtime; the Indic recognisers already read "
+                        "embedded English, so this measured ~0.1 points on "
+                        "Telugu posters. Off by default.")
     p.add_argument("--formats", nargs="+", default=["txt", "json"],
                    choices=["txt", "json", "csv"],
                    help="Export formats (default: txt json).")
@@ -99,19 +120,65 @@ def report(result: OCRResult, quiet: bool) -> None:
           f"mean_conf={result.mean_confidence:.4f}  time={result.total_time:.3f}s")
     if result.dropped_low_confidence:
         print(f"  dropped below threshold: {result.dropped_low_confidence}")
+    # In auto mode, show which script was detected for this image.
+    detected = getattr(result, 'extra', {}).get('detected_script')
+    if detected:
+        print(f"  detected script: {detected}")
     if quiet:
         return
     for i, (block, line_no) in enumerate(zip(result.blocks, result.line_numbers)):
         print(f"    [{i:>3}] L{line_no:<3} {block.confidence:.4f}  {block.text}")
 
 
+def print_languages() -> None:
+    by_script: dict[str, list[str]] = {}
+    for code, script in sorted(LANGUAGE_SCRIPTS.items()):
+        by_script.setdefault(script, []).append(code)
+
+    print("Supported — languages sharing a script share one recognition pass:\n")
+    for script, codes in sorted(by_script.items()):
+        weak = "  (v3 model, weaker than the rest)" if script in KNOWN_WEAK else ""
+        print(f"  {script:<12} {', '.join(codes)}{weak}")
+
+    print("\nNot supported — PaddleOCR ships no recognition model for these "
+          "scripts,\nat any version:\n")
+    for code, name in sorted(UNSUPPORTED_SCRIPTS.items(), key=lambda kv: kv[1]):
+        print(f"  {code:<5} {name}")
+    print("\nCombine with '+', e.g. --lang hi+en. Each additional *script* "
+          "roughly\ndoubles runtime; extra languages on the same script are free.")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    langs = [x.strip() for x in args.lang.split("+") if x.strip()]
-    if not langs:
+    if args.list_languages:
+        print_languages()
+        return 0
+    if args.input is None:
+        print("error: an input image or directory is required", file=sys.stderr)
+        return 2
+
+    requested = [x.strip() for x in args.lang.split("+") if x.strip()]
+    if not requested:
         print("error: --lang must name at least one language", file=sys.stderr)
         return 2
+
+    # 'auto' enables per-image script detection across all supported scripts.
+    auto_mode = len(requested) == 1 and requested[0].lower() == "auto"
+
+    if auto_mode:
+        langs = list(AUTO_DETECT_SCRIPTS)
+    else:
+        # Collapse languages to the scripts that actually drive recognition passes.
+        try:
+            pairs = resolve_models(requested)
+        except UnsupportedLanguage as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        langs = [script for script, _ in pairs]
+        if len(langs) < len(requested):
+            print(f"Note: {len(requested)} languages share {len(langs)} script(s) — "
+                  f"running {len(langs)} pass(es).")
 
     try:
         images = find_images(args.input)
@@ -129,7 +196,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print(f"Images       : {len(images)}")
-    print(f"Languages    : {' + '.join(langs)}")
+    if auto_mode:
+        print(f"Languages    : auto — detecting the script of each image "
+              f"({len(langs)} candidates)")
+    else:
+        print(f"Languages    : {' + '.join(langs)}")
     print(f"Preprocessing: {'enabled' if pre_config.any_enabled else 'none'}")
     print("Loading PaddleOCR models (first run downloads them)...")
 
@@ -139,11 +210,14 @@ def main(argv: list[str] | None = None) -> int:
                        det_limit_side_len=args.det_limit,
                        det_db_unclip_ratio=args.unclip,
                        det_model="" if args.legacy_det else args.det_model,
-                       drop_score=0.0)  # filter once, in process_image, so the
+                       drop_score=0.0,  # filter once, in process_image, so the
                                         # "dropped" count reflects reality
+                       auto_mode=auto_mode,
+                       auto_merge_latin=args.auto_merge_latin)
     engine.warmup()
 
     results: list[OCRResult] = []
+    reported_scores = False
     for n, image_path in enumerate(images, start=1):
         print(f"\n[{n}/{len(images)}] {image_path.name}")
         try:
@@ -155,6 +229,25 @@ def main(argv: list[str] | None = None) -> int:
                                      {"total": 0.0}, error=f"{type(exc).__name__}: {exc}"))
             report(results[-1], args.quiet)
             continue
+
+        # Stash the detected script name so report() can display it.
+        if auto_mode and engine.detected_langs:
+            result.extra["detected_script"] = engine.detected_langs[0]
+            result.extra["script_scores"] = {
+                k: round(v, 4) for k, v in engine.auto_scores.items()}
+
+        # Show the probe scores per image, so each choice is auditable rather
+        # than asserted. A narrow margin means the detection itself is a coin
+        # flip, which the user needs to see.
+        if auto_mode and engine.auto_scores:
+            ranked = sorted(engine.auto_scores.items(), key=lambda kv: -kv[1])
+            gap = margin(engine.auto_scores)
+            if not args.quiet:
+                print("  script probe: "
+                      + ", ".join(f"{s}={v:.3f}" for s, v in ranked[:4]))
+            if gap < CONFIDENT_MARGIN and len(ranked) > 1:
+                print(f"  WARNING: {ranked[0][0]} beat {ranked[1][0]} by only "
+                      f"{gap:.3f} — detection unreliable here, prefer --lang.")
 
         report(result, args.quiet)
         for path in export(result, args.output_dir, args.formats):

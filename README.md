@@ -22,8 +22,11 @@ processing time, and number of detected text blocks.
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
-# 2. drop poster images into data/input/, then run
+# 2. drop poster images into data/input/, then run — the script is auto-detected
 .\.venv\Scripts\python.exe run_ocr.py data\input --formats txt json csv
+
+# faster when you already know the language (skips detection)
+.\.venv\Scripts\python.exe run_ocr.py data\input --lang te
 ```
 
 Results land in `outputs/`. First run downloads ~100 MB of models.
@@ -65,6 +68,25 @@ py -3.12 -m venv .venv
 Takes a few minutes — `paddlepaddle` is a ~100 MB download. The version pins in
 [requirements.txt](requirements.txt) are **not arbitrary**; see
 [Version pins](#version-pins-and-why-they-are-exact) before changing them.
+
+> **Do not put `.venv` inside a OneDrive-synced folder.** OneDrive Files
+> On-Demand replaces idle files with cloud placeholders, and once it does that
+> to numpy's `.pyd` binaries Python cannot load them:
+>
+> ```
+> ImportError: Error importing numpy: you should not try to import numpy
+>         from its source directory ...
+> ```
+>
+> The environment appears to break on its own, with no code change. Marking the
+> folder "always keep on this device" is not reliable here — create the venv
+> outside the synced tree instead:
+>
+> ```powershell
+> py -3.12 -m venv C:\ocr_venv
+> C:\ocr_venv\Scripts\python.exe -m pip install -r requirements.txt
+> C:\ocr_venv\Scripts\python.exe run_ocr.py data\input
+> ```
 
 ### Step 4 — Put your poster images in `data/input/`
 
@@ -129,6 +151,7 @@ processing time per image.
 | `Type of attribute: strides is not right` | `paddlepaddle` is too old for PP-OCRv5 models. Needs ≥ 3.2. |
 | `ConvertPirAttribute2RuntimeAttribute not support` | `paddlepaddle` 3.3.x PIR bug on Windows CPU. Pin to 3.2.0. |
 | `DLL load failed ... Application Control policy` | A locked-down Windows host blocking `pandas` 3.x / `matplotlib` binaries. `pip install "pandas<3"` and uninstall `matplotlib`. |
+| `Error importing numpy: you should not try to import numpy from its source directory` | `.venv` is inside OneDrive and its `.pyd` files were turned into cloud placeholders. Recreate the venv outside the synced folder (see Step 3). |
 | First run hangs at "Loading PaddleOCR models" | It is downloading models. Needs internet; give it a few minutes. |
 | Telugu shows as `?????` in the console | Cosmetic — terminal codepage. Files in `outputs/` are correct UTF-8. Fix with `chcp 65001`. |
 | Telugu is mojibake in Excel | Open the `.csv` via Data → From Text/CSV and pick UTF-8, or use the `.json`. |
@@ -140,7 +163,9 @@ processing time per image.
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--lang` | `te` | `'+'`-separated recognition passes. `te`, `en`, or both. `te+en` measured no better than `te` alone and takes 3.7× longer. |
+| `--lang` | `auto` | `auto` detects the script (see [Automatic language detection](#automatic-language-detection)), or `'+'`-separated languages (`te`, `hi`, `ta`, `kn`, `ur`, `en`, …). Languages sharing a script share one pass. |
+| `--auto-merge-latin` | off | In auto mode, add a Latin pass. Doubles runtime for ~0.1 points. |
+| `--list-languages` | — | Print supported languages and scripts, then exit. |
 | `--det-model` | `PP-OCRv6_medium_det` | Detection model name. |
 | `--legacy-det` | off | Use PaddleOCR's lang-default v5 detector instead of v6. |
 | `--formats` | `txt json` | Any of `txt`, `json`, `csv`. |
@@ -375,7 +400,127 @@ blocked on locked-down Windows hosts.
 
 ---
 
-## Why `te+en` runs two passes
+## Automatic language detection
+
+`--lang` defaults to `auto`, so the plain command detects the script itself:
+
+```powershell
+.\.venv\Scripts\python.exe run_ocr.py data\input
+```
+
+```
+Languages    : auto — probing 6 scripts on the first image, then reusing the winner
+  script probe: telugu=0.935, kannada=0.758, tamil=0.646, latin=0.640, arabic=0.595, devanagari=0.533
+  detected script: telugu
+```
+
+**How it works.** Detection is script-agnostic, so the boxes are found once and
+a handful of the largest crops are shown to each candidate recogniser. The
+right script returns high-confidence readable text; the wrong one returns
+low-confidence noise. Scores are character-weighted, so a confident
+two-character read cannot outrank a script that produced full lines.
+
+Crucially this runs **per image, not per batch** — a mixed folder is read
+correctly:
+
+| Image | Detected | Score | Margin |
+|---|---|---|---|
+| Telugu history poster | telugu | 0.959 | 0.19 |
+| Marathi assembly notice | devanagari | 0.968 | 0.31 |
+| Marathi districts list | devanagari | 0.953 | 0.26 |
+| Marathi court recruitment | devanagari | 0.965 | 0.11 |
+
+The probe scores print for every image, so each choice is **auditable rather
+than asserted**. If the top two land within 0.05 the run warns you and
+recommends an explicit `--lang`, because at that margin the heuristic is a coin
+flip.
+
+**Why crops and not whole images.** An earlier version ran six *full* PaddleOCR
+pipelines per image. That cost ~55 s and, because every PaddleOCR instance
+carries its own copy of the detector, holding six at once crashed the process
+with an access violation partway through the fifth model. Standalone
+recognisers are small enough to keep all six resident and score in a few
+seconds.
+
+**Cost.** ~14 s/image including detection. An explicit `--lang` skips the probe
+entirely and runs at ~4.5 s/image, so name the language when you know it:
+
+```powershell
+.\.venv\Scripts\python.exe run_ocr.py data\input --lang te     # ~4.5 s/image
+```
+
+**Limitation worth knowing:** detection is per *image*, not per *region*. A
+poster mixing Hindi and Tamil in one image resolves to whichever script
+dominates its largest text. Genuinely bilingual images still need an explicit
+`--lang hi+ta`.
+
+Auto mode does **not** add a Latin pass by default — it doubles runtime and the
+Indic recognisers already read embedded English (`Kotilingala`, `TGPSC`,
+`GROUP-1`, `@tgpsc_wala_00` all came through a Telugu-only pass). Use
+`--auto-merge-latin` if an image is English-dominant.
+
+---
+
+## Indian language support
+
+Indian-language OCR is a **script** routing problem, not a language one. Hindi,
+Marathi, Nepali and Sanskrit are four languages sharing one Devanagari
+recogniser, so thirteen languages need six models, not thirteen.
+
+```powershell
+.\.venv\Scripts\python.exe run_ocr.py --list-languages
+```
+
+| Script | Languages | Model |
+|---|---|---|
+| Devanagari | Hindi, Marathi, Nepali, Sanskrit, Maithili, Konkani, Dogri, Bodo, Bhojpuri | `devanagari_PP-OCRv5_mobile_rec` |
+| Telugu | Telugu | `te_PP-OCRv5_mobile_rec` |
+| Tamil | Tamil | `ta_PP-OCRv5_mobile_rec` |
+| Kannada | Kannada | `ka_PP-OCRv3_mobile_rec` ⚠ |
+| Perso-Arabic | Urdu, Kashmiri, Sindhi | `arabic_PP-OCRv5_mobile_rec` |
+| Latin | English, romanised text | `PP-OCRv6_medium_rec` |
+
+⚠ Kannada's only model is PP-OCRv3. Telugu gained ~8 points moving v3 → v5, so
+expect Kannada output to be correspondingly weaker than the other scripts.
+
+Languages sharing a script cost **one** pass, so `--lang hi+mr+ne` is no slower
+than `--lang hi`. Each additional *script* roughly doubles runtime.
+
+```powershell
+.\.venv\Scripts\python.exe run_ocr.py data\input --lang hi        # Hindi
+.\.venv\Scripts\python.exe run_ocr.py data\input --lang hi+en     # Hindi + English
+.\.venv\Scripts\python.exe run_ocr.py data\input --lang ta+en     # Tamil + English
+```
+
+### Not supported — and no configuration fixes it
+
+PaddleOCR ships **no recognition model at any version** for these scripts:
+
+| | |
+|---|---|
+| Bengali, Assamese | ~120M speakers |
+| Malayalam | ~35M |
+| Gujarati | ~55M |
+| Punjabi (Gurmukhi) | ~33M |
+| Odia | ~35M |
+| Santali (Ol Chiki), Manipuri (Meitei Mayek) | |
+
+Roughly **250 million speakers uncovered**. Requesting one fails with an
+explicit error rather than falling back to another script's model — that
+fallback would not error, it would return confident nonsense:
+
+```
+$ run_ocr.py data\input --lang bn
+error: Bengali (bn) has no PaddleOCR recognition model at any version,
+so this pipeline cannot read it.
+```
+
+Covering them needs a second OCR engine (Tesseract has all of them) or a
+fine-tuned model. Neither is in this repo.
+
+---
+
+## Why multi-script runs use one pass per script
 
 No single PaddleOCR recognition model handles Telugu and Latin equally well.
 The `te` model's dictionary includes ASCII, so it reads English — just less
@@ -487,6 +632,8 @@ output at 0.39, which is the honest answer.
 | [src/pipeline.py](src/pipeline.py) | One image end-to-end, stage timing |
 | [src/preprocess.py](src/preprocess.py) | Optional image stages, non-ASCII-safe loading |
 | [src/ocr_engine.py](src/ocr_engine.py) | PaddleOCR wrapper, `TextBlock`, multi-pass merge |
+| [src/scripts.py](src/scripts.py) | Indian language → script → model routing |
+| [src/detect_script.py](src/detect_script.py) | Per-image script detection by crop probing |
 | [src/reading_order.py](src/reading_order.py) | Line grouping and text rendering |
 | [src/exporter.py](src/exporter.py) | `OCRResult` + TXT/JSON/CSV writers |
 | [src/visualize.py](src/visualize.py) | Annotated debug overlay |
@@ -505,9 +652,9 @@ while quietly discarding the settings they carry.
 
 ## Tests
 
-28 tests covering preprocessing, coordinate mapping, reading order, the
+51 tests covering preprocessing, coordinate mapping, reading order, the
 multi-pass merge (including the word-inside-line case), detector/recogniser
-pairing, both result-parser formats, and all three exporters. PaddleOCR is
+pairing, per-image script detection, and all three exporters. PaddleOCR is
 stubbed, so they run without it:
 
 ```powershell

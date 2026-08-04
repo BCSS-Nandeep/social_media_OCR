@@ -13,11 +13,15 @@ Two things this layer exists to hide:
 
 from __future__ import annotations
 
+import gc
 import time
 from dataclasses import dataclass
 from typing import Any, Sequence
 
 import numpy as np
+
+from .detect_script import ScriptDetector
+from .scripts import SCRIPT_MODELS
 
 
 # PP-OCRv6 (PaddleOCR 3.7, June 2026) covers Chinese, English, Japanese and the
@@ -33,11 +37,14 @@ import numpy as np
 # from 57 boxes to 28), so the recogniser sees whole lines instead of shards.
 DETECTION_MODEL = "PP-OCRv6_medium_det"
 
-# Recognition model per language. A language absent here falls back to
-# PaddleOCR's own lang-based resolution.
+# Recognition model per pass key. Indian scripts come from scripts.py, which
+# derives them from the installed model registry; the CJK entries are
+# PaddleOCR's own and are kept for callers outside the Indian-language set.
+# A key absent here falls back to PaddleOCR's lang-based resolution.
 RECOGNITION_MODELS = {
-    "te": "te_PP-OCRv5_mobile_rec",   # newest Telugu model that exists
-    "en": "PP-OCRv6_medium_rec",
+    **SCRIPT_MODELS,
+    "te": SCRIPT_MODELS["telugu"],    # legacy keys, still accepted
+    "en": SCRIPT_MODELS["latin"],
     "ch": "PP-OCRv6_medium_rec",
     "japan": "PP-OCRv6_medium_rec",
     "chinese_cht": "PP-OCRv6_medium_rec",
@@ -113,7 +120,8 @@ class OCREngine:
                  use_angle_cls: bool = False, det_db_box_thresh: float = 0.5,
                  drop_score: float = 0.0, det_limit_side_len: int = 960,
                  det_db_unclip_ratio: float = 1.5, det_model: str | None = None,
-                 paddle_extra: dict[str, Any] | None = None):
+                 paddle_extra: dict[str, Any] | None = None,
+                 auto_mode: bool = False, auto_merge_latin: bool = False):
         self.langs = list(langs)
         self.use_gpu = use_gpu
         # Off by default. The textline orientation classifier is trained on
@@ -144,6 +152,24 @@ class OCREngine:
         self.paddle_extra = dict(paddle_extra or {})
         self._models: dict[str, Any] = {}
         self._api = None  # "v3" or "v2", detected on first build
+        # Auto-detection mode: try every script per image and pick the winner.
+        self.auto_mode = auto_mode
+        # Off by default: an extra Latin pass doubles runtime, and the Indic
+        # recognisers' dictionaries already include ASCII. Measured on Telugu
+        # posters, adding the Latin pass moved document accuracy by 0.1 points
+        # while taking 3.7x longer, and the Telugu-only pass had already found
+        # TGPSC, GROUP-1, SEPTEMBER, @tgpsc_wala_00 and so on.
+        self.auto_merge_latin = auto_merge_latin
+        # After run_auto(), holds the script(s) that actually produced the
+        # output for the most recent image.  Used by the pipeline to report
+        # which language was detected rather than listing all candidates.
+        self.detected_langs: list[str] | None = None
+        # Script chosen for the image currently being processed.
+        self._auto_choice: str | None = None
+        self._detector: ScriptDetector | None = None
+        # Per-script probe scores from the most recent detection, so the CLI can
+        # show *why* a script was chosen and how close the runner-up was.
+        self.auto_scores: dict[str, float] = {}
 
     # ------------------------------------------------------------------ build
 
@@ -212,8 +238,28 @@ class OCREngine:
             self._models[lang] = self._build(lang)
         return self._models[lang]
 
+    def _release(self, lang: str) -> None:
+        """Drop a built pipeline and reclaim its memory.
+
+        Each PaddleOCR instance carries its *own* copy of the detector, not a
+        shared one. Holding all six script pipelines at once therefore means six
+        copies of PP-OCRv6_medium_det plus six recognisers, which segfaults the
+        process (access violation, exit -1073741819) partway through the fifth
+        model. Auto-detection releases each pipeline as soon as it has scored,
+        so only one is resident at a time.
+        """
+        if self._models.pop(lang, None) is not None:
+            gc.collect()
+
     def warmup(self) -> None:
-        """Build every model + run one tiny inference so timings exclude load cost."""
+        """Build every model + run one tiny inference so timings exclude load cost.
+
+        In auto mode, skip warmup: loading all six detector+recogniser pairs
+        at once uses too much RAM on some systems.  Models will load lazily on
+        their first real image instead.
+        """
+        if self.auto_mode:
+            return
         blank = np.full((64, 256, 3), 255, dtype=np.uint8)
         for lang in self.langs:
             try:
@@ -263,6 +309,9 @@ class OCREngine:
 
     def run(self, image: np.ndarray) -> tuple[list[TextBlock], dict[str, float]]:
         """Run every configured language pass. Returns (merged blocks, per-lang seconds)."""
+        if self.auto_mode:
+            return self._run_auto(image)
+
         per_lang: dict[str, float] = {}
         collected: list[TextBlock] = []
 
@@ -274,7 +323,65 @@ class OCREngine:
 
         if len(self.langs) > 1:
             collected = merge_by_overlap(collected)
+        self.detected_langs = None  # explicit-mode: no auto-detection happened
         return collected, per_lang
+
+    @property
+    def detector(self) -> ScriptDetector:
+        if self._detector is None:
+            probe_model = self.det_model or DETECTION_MODEL
+            self._detector = ScriptDetector(probe_model)
+        return self._detector
+
+    def _run_auto(self, image: np.ndarray) -> tuple[list[TextBlock], dict[str, float]]:
+        """Detect this image's script, then read it with that script.
+
+        Detection happens **per image**, not per batch. An earlier version
+        probed once and reused the winner, which read three Hindi posters with
+        the Telugu model and returned confident transliterated noise
+        (``HU$IR' Ran ucia Ral 202E`` for a Devanagari headline). A folder is
+        not reliably one language, so it cannot be assumed to be.
+
+        The probe reads only a handful of crops through standalone recognisers
+        rather than running six full pipelines, which is both far quicker and
+        the reason this no longer exhausts memory.
+        """
+        start = time.perf_counter()
+        script, scores = self.detector.detect(image)
+        probe_seconds = time.perf_counter() - start
+
+        self.auto_scores = dict(scores)
+        # Fall back to Latin only when detection found nothing at all to score.
+        script = script or "latin"
+
+        # One script's pipeline at a time: releasing the previous one keeps a
+        # mixed-language batch from accumulating every model it has ever seen.
+        if self._auto_choice is not None and self._auto_choice != script:
+            self._release(self._auto_choice)
+        self._auto_choice = script
+
+        blocks, per_lang = self._run_chosen(image, script)
+        per_lang["script-probe"] = probe_seconds
+        return blocks, per_lang
+
+    def _run_chosen(self, image: np.ndarray, script: str) -> tuple[list[TextBlock],
+                                                                  dict[str, float]]:
+        """Read one image with an already-detected script, merged with Latin."""
+        per_lang: dict[str, float] = {}
+        start = time.perf_counter()
+        blocks = self._run_single(image, script)
+        per_lang[script] = time.perf_counter() - start
+
+        if self.auto_merge_latin and script != "latin":
+            start = time.perf_counter()
+            latin = self._run_single(image, "latin")
+            per_lang["latin"] = time.perf_counter() - start
+            blocks = merge_by_overlap(blocks + latin)
+            self.detected_langs = [script, "latin"]
+        else:
+            self.detected_langs = [script]
+        return blocks, per_lang
+
 
 
 # ------------------------------------------------------------------- merging
