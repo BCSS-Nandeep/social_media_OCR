@@ -31,6 +31,14 @@ py -3.12 -m venv .venv
 
 Results land in `outputs/`. First run downloads ~100 MB of models.
 
+**REST API** — the same pipeline is also exposed over HTTP:
+
+```powershell
+uvicorn src.api:app --reload      # Swagger at /docs
+```
+
+See [API.md](API.md) for endpoints, curl examples and configuration.
+
 ---
 
 ## How to run — step by step
