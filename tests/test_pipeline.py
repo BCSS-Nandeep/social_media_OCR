@@ -46,39 +46,116 @@ class TextBlockTests(unittest.TestCase):
         self.assertIs(b.scaled(1.0), b)
 
 
-class FakeParser:
-    """Stands in for IndicOCR.parse(): returns fixed blocks for any page."""
+class FakeBlock:
+    """Stands in for IndicOCR's own Block dataclass (order/label/type/bbox_xyxy/conf/text)."""
 
-    def parse(self, path):
-        return {
-            "blocks": [
-                {"order": 0, "label": "Title", "type": "Title",
-                 "bbox_xyxy": [0, 0, 300, 60], "conf": 0.95, "text": "BIG SALE"},
-                {"order": 1, "label": "Paragraph", "type": "Text",
-                 "bbox_xyxy": [0, 160, 300, 220], "conf": 0.55, "text": TELUGU},
-                {"order": 2, "label": "Image", "type": "Picture",
-                 "bbox_xyxy": [0, 260, 300, 400], "conf": 0.80, "text": ""},
-            ],
-            "markdown": f"BIG SALE\n\n{TELUGU}",
-        }
+    def __init__(self, order, label, type_, bbox, conf, text=None):
+        self.order, self.label, self.type = order, label, type_
+        self.bbox_xyxy, self.conf, self.text = bbox, conf, text
+
+
+class FakePage:
+    def __init__(self, blocks):
+        self.blocks = blocks
+
+
+class FakeLayoutModel:
+    """Stands in for IndicDocLayout: returns fixed blocks for any page."""
+
+    def __init__(self, blocks):
+        self._blocks = blocks
+
+    def detect(self, path):
+        return FakePage(self._blocks)
+
+
+class FakeOCRModel:
+    """Stands in for IndicBlockOCR: records what label/type each block had when it
+    was handed to the recogniser, then returns fixed text keyed by block order."""
+
+    def __init__(self, text_by_order):
+        self.text_by_order = text_by_order
+        self.seen: dict[int, tuple[str, str]] = {}
+
+    def run(self, path, layout):
+        out = []
+        for b in layout.blocks:
+            self.seen[b.order] = (b.label, b.type)
+            out.append(FakeBlock(b.order, b.label, b.type, b.bbox_xyxy, b.conf,
+                                 self.text_by_order.get(b.order, "")))
+        return FakePage(out)
+
+
+def _stub_engine(blocks, text_by_order) -> tuple[OCREngine, FakeOCRModel]:
+    engine = OCREngine()
+    engine._layout_model = FakeLayoutModel(blocks)
+    ocr = FakeOCRModel(text_by_order)
+    engine._ocr_model = ocr
+    return engine, ocr
 
 
 class OCREngineTests(unittest.TestCase):
     def test_run_parses_blocks_in_order_and_returns_markdown(self):
-        engine = OCREngine()
-        engine._parser = FakeParser()
-        blocks, markdown = engine.run(np.full((400, 300, 3), 255, np.uint8))
-        self.assertEqual([b.text for b in blocks], ["BIG SALE", TELUGU, ""])
-        self.assertEqual([b.order for b in blocks], [0, 1, 2])
+        blocks = [FakeBlock(0, "Title", "Title", [0, 0, 300, 60], 0.95),
+                 FakeBlock(1, "Paragraph", "Text", [0, 160, 300, 220], 0.55)]
+        engine, _ = _stub_engine(blocks, {0: "BIG SALE", 1: TELUGU})
+        result, markdown = engine.run(np.full((400, 300, 3), 255, np.uint8))
+        self.assertEqual([b.text for b in result], ["BIG SALE", TELUGU])
+        self.assertEqual([b.order for b in result], [0, 1])
         self.assertEqual(markdown, f"BIG SALE\n\n{TELUGU}")
 
-    def test_untranscribed_blocks_keep_their_box_and_confidence(self):
-        engine = OCREngine()
-        engine._parser = FakeParser()
-        blocks, _ = engine.run(np.full((400, 300, 3), 255, np.uint8))
-        picture = blocks[2]
-        self.assertEqual(picture.block_type, "Picture")
-        self.assertEqual(picture.confidence, 0.80)
+
+class ForceOCRTests(unittest.TestCase):
+    """IndicOCR never sends Image/Header/Footer/... blocks to the recogniser by
+    default -- these test the wrapper's override, since a real poster's headline
+    is routinely baked into exactly that kind of block (see ocr_engine.py)."""
+
+    def test_skip_label_blocks_are_relabelled_before_recognition(self):
+        blocks = [FakeBlock(0, "Image", "Picture", [0, 0, 300, 400], 0.9)]
+        engine, ocr = _stub_engine(blocks, {0: "some text"})
+        engine.run(np.full((400, 300, 3), 255, np.uint8))
+        self.assertEqual(ocr.seen[0], ("Paragraph", "Text"))
+
+    def test_original_label_and_type_are_restored_on_output(self):
+        blocks = [FakeBlock(0, "Image", "Picture", [0, 0, 300, 400], 0.9)]
+        engine, _ = _stub_engine(blocks, {0: "some text"})
+        result, _ = engine.run(np.full((400, 300, 3), 255, np.uint8))
+        self.assertEqual((result[0].label, result[0].block_type), ("Image", "Picture"))
+        self.assertEqual(result[0].text, "some text")
+
+    def test_non_skip_labels_are_left_alone(self):
+        blocks = [FakeBlock(0, "Paragraph", "Text", [0, 0, 300, 60], 0.9)]
+        engine, ocr = _stub_engine(blocks, {0: "BIG SALE"})
+        engine.run(np.full((400, 300, 3), 255, np.uint8))
+        self.assertEqual(ocr.seen[0], ("Paragraph", "Text"))
+
+    def test_untranscribed_forced_block_stays_empty(self):
+        blocks = [FakeBlock(0, "Image", "Picture", [0, 0, 300, 400], 0.9)]
+        engine, _ = _stub_engine(blocks, {})  # recogniser found nothing there
+        result, markdown = engine.run(np.full((400, 300, 3), 255, np.uint8))
+        self.assertEqual(result[0].text, "")
+        self.assertEqual(markdown, "")
+
+    def test_forced_text_deduped_against_already_transcribed_blocks(self):
+        # Mirrors a real poster: a giant "Image" region the layout stage never
+        # meant to transcribe turned out to span two paragraphs already read
+        # correctly on their own, plus one genuinely new headline line.
+        blocks = [
+            FakeBlock(0, "Title", "Title", [0, 0, 300, 60], 0.95),
+            FakeBlock(1, "Paragraph", "Text", [0, 160, 300, 220], 0.55),
+            FakeBlock(2, "Image", "Picture", [0, 0, 300, 400], 0.90),
+        ]
+        text_by_order = {
+            0: "BIG SALE",
+            1: "OPEN PLOTS NEAR SHAMSHABAD",
+            2: "BIG SALE\nHIDDEN HEADLINE\nOPEN PLOTS NEAR SHAMSHABAD",
+        }
+        engine, _ = _stub_engine(blocks, text_by_order)
+        result, markdown = engine.run(np.full((400, 300, 3), 255, np.uint8))
+        forced = next(b for b in result if b.order == 2)
+        self.assertEqual(forced.text, "HIDDEN HEADLINE")
+        self.assertIn("HIDDEN HEADLINE", markdown)
+        self.assertEqual(markdown.count("BIG SALE"), 1)
 
 
 class PreprocessTests(unittest.TestCase):

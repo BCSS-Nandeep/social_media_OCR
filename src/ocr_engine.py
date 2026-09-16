@@ -7,6 +7,20 @@ there is no per-language pass, model pairing, or cross-language merge step to
 manage -- the multi-recogniser machinery the PaddleOCR engine needed here is
 gone because one model reads every supported script in a single call.
 
+IndicOCR's own pipeline never sends Header/Footer/Diagram/Image/Chart/
+Advertisement blocks to the recogniser (see FORCE_OCR_LABELS below) -- by
+design, to avoid hallucinating text onto photos. On document scans that is
+the right call. On social-media posters it routinely is not: headline text
+is often baked straight into a photo or graphic, and the layout stage files
+the whole region as "Image" without ever trying to read what's on it.
+Measured on a real poster, a giant "Image" block that IndicOCR would have
+left as text="" was the poster's entire headline -- "UCC WILL BE
+IMPLEMENTED IN 21 STATES BEFORE 2029" plus a second banner -- while the
+recogniser read it correctly the moment it was actually asked to. This
+wrapper relabels those blocks before the recogniser sees them, then dedups
+their output against whatever nearby blocks already captured on their own
+(a photo-with-headline can span the whole page, paragraphs and all).
+
 The gated HF repo requires a Hugging Face account with access granted
 (request it at the model page) and either `hf auth login` or an `HF_TOKEN`
 env var before the first download will succeed.
@@ -14,6 +28,7 @@ env var before the first download will succeed.
 
 from __future__ import annotations
 
+import difflib
 import os
 import subprocess
 import sys
@@ -27,15 +42,48 @@ import numpy as np
 
 MODEL_REPO = "bodhan-ai/indic-ocr"
 
+# Case-insensitive, matching IndicOCR's own idp_contract.OCR_SKIP_LABELS
+# exactly -- these are the labels its pipeline never transcribes.
+FORCE_OCR_LABELS = frozenset({"header", "footer", "diagram", "image", "chart", "advertisement"})
+
+# What forced blocks get relabelled to before the recogniser sees them.
+# Both fields matter: idp_crops.py skips cropping when *either* the label is
+# in OCR_SKIP_LABELS *or* the type is in DROP_TYPES ({"Figure", "Picture"}),
+# so changing only one leaves the block uncropped and the fix is a no-op.
+_FORCE_LABEL, _FORCE_TYPE = "Paragraph", "Text"
+
+# A forced block's crop often overlaps a block that was already transcribed
+# normally (the giant "Image" region above literally contained two
+# paragraphs IndicOCR had already read correctly on their own). Exact-match
+# dedup misses near-duplicates -- the two recogniser passes over the same
+# text can read it slightly differently -- so lines are compared fuzzily
+# against every normally-transcribed block's text instead.
+_DEDUP_SIMILARITY = 0.75
+
+
+def _dedup_forced_text(text: str, known_lines: list[str]) -> str:
+    kept = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if any(difflib.SequenceMatcher(None, line.lower(), known.lower()).ratio()
+               >= _DEDUP_SIMILARITY for known in known_lines):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
 
 @dataclass
 class TextBlock:
     """One detected layout block and its transcription.
 
     `confidence` is IndicDocLayout's *detection* confidence -- IndicOCR does
-    not expose a separate per-block transcription score. Pictorial and margin
-    blocks (Image, Header, Footer, ...) carry a real box and confidence but
-    `text == ""`; they were detected, just not sent to the recogniser.
+    not expose a separate per-block transcription score. `label`/`block_type`
+    always reflect IndicDocLayout's original classification, even for a
+    block this wrapper force-transcribed against that classification's
+    advice (see FORCE_OCR_LABELS) -- so a consumer can still tell "this text
+    came out of what was detected as a photo."
     """
 
     text: str
@@ -88,11 +136,12 @@ class TextBlock:
 
 
 class OCREngine:
-    """Lazily-built IndicOCR parser."""
+    """Lazily-built IndicOCR layout + recognition stages."""
 
     def __init__(self, table_format: str = "html"):
         self.table_format = table_format
-        self._parser = None
+        self._layout_model = None
+        self._ocr_model = None
 
     def _build(self):
         try:
@@ -116,7 +165,8 @@ class OCREngine:
             sys.path.insert(0, repo)
 
         try:
-            from indic_ocr import IndicOCR
+            from idp_offline import IndicBlockOCR, IndicDocLayout
+            from idp_types import RecognizerConfig, TableFormat
         except ImportError:
             # The model ships its own installer, which reads the local driver
             # and picks matching CUDA wheels for torch/transformers -- running
@@ -129,15 +179,19 @@ class OCREngine:
             env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
             subprocess.run(["bash", str(Path(repo) / "install.sh")],
                            check=True, cwd=repo, env=env)
-            from indic_ocr import IndicOCR
+            from idp_offline import IndicBlockOCR, IndicDocLayout
+            from idp_types import RecognizerConfig, TableFormat
 
-        return IndicOCR.from_pretrained(repo, table_format=self.table_format)
+        layout_model = IndicDocLayout(f"{repo}/weights/layout")
+        ocr_model = IndicBlockOCR(f"{repo}/weights/ocr",
+                                  config=RecognizerConfig(table_format=TableFormat(self.table_format)))
+        return layout_model, ocr_model
 
     @property
-    def model(self):
-        if self._parser is None:
-            self._parser = self._build()
-        return self._parser
+    def _models(self):
+        if self._layout_model is None:
+            self._layout_model, self._ocr_model = self._build()
+        return self._layout_model, self._ocr_model
 
     def warmup(self) -> None:
         """Build the model + run one tiny inference so timings exclude load cost."""
@@ -148,18 +202,38 @@ class OCREngine:
             pass
 
     def run(self, image: np.ndarray) -> tuple[list[TextBlock], str]:
-        """Run the parser on an image array. Returns (ordered blocks, page markdown)."""
+        """Run layout + recognition on an image array. Returns (ordered blocks, page markdown)."""
+        layout_model, ocr_model = self._models
+
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             tmp_path = tmp.name
         try:
             cv2.imwrite(tmp_path, image)
-            page = self.model.parse(tmp_path)
+            layout = layout_model.detect(tmp_path)
+
+            original = {b.order: (b.label, b.type) for b in layout.blocks}
+            forced_orders = {b.order for b in layout.blocks
+                             if b.label.strip().lower() in FORCE_OCR_LABELS}
+            for b in layout.blocks:
+                if b.order in forced_orders:
+                    b.label, b.type = _FORCE_LABEL, _FORCE_TYPE
+
+            page = ocr_model.run(tmp_path, layout)
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
-        blocks = [
-            TextBlock(b["text"], float(b["conf"]), [float(v) for v in b["bbox_xyxy"]],
-                      int(b["order"]), b["label"], b["type"])
-            for b in sorted(page["blocks"], key=lambda b: b["order"])
-        ]
-        return blocks, page["markdown"]
+        known_lines = [line.strip()
+                       for b in page.blocks if b.order not in forced_orders
+                       for line in (b.text or "").splitlines() if line.strip()]
+
+        blocks = []
+        for b in sorted(page.blocks, key=lambda b: b.order):
+            label, block_type = original[b.order]
+            text = b.text or ""
+            if b.order in forced_orders and text:
+                text = _dedup_forced_text(text, known_lines)
+            blocks.append(TextBlock(text, float(b.conf), [float(v) for v in b.bbox_xyxy],
+                                    int(b.order), label, block_type))
+
+        markdown = "\n\n".join(b.text for b in blocks if b.text)
+        return blocks, markdown
