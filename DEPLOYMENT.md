@@ -139,21 +139,26 @@ reading the config:
   disruptive test, not declined for cost, just not done without asking on
   someone else's running instance.
 
-### Known quirk: cold-start latency after a crash is variable
+### Known quirk: cold-start latency after a crash is variable, and can run
+### into minutes
 
-The first health check after a *fresh* process start succeeded in under 10
-seconds. After the `kill -9` test specifically, the replacement process took
-noticeably longer (~1-2 minutes) before `/health` responded, despite PM2
-already reporting it `online` — PM2 considers a process "online" once it
-forks, not once IndicOCR's own startup (model load + GPU warmup, done in
-FastAPI's `lifespan`) actually completes. `nvidia-smi` showed real GPU
-utilization throughout, so it wasn't hung, just slow — plausibly CUDA
-context re-initialization after an unclean kill of the previous process.
+The first health check after a *fresh* `pm2 start`/`pm2 delete && pm2 start`
+consistently succeeded in 15-35 seconds. After a `kill -9` specifically,
+reproduced twice independently (once against a 4-worker pool, once against
+the current 1-worker default), the replacement process took **2-4+ minutes**
+before `/health` responded, despite PM2 already reporting it `online` — PM2
+considers a process "online" once it forks, not once IndicOCR's own startup
+(model load + GPU warmup, done in FastAPI's `lifespan`) actually completes.
+`nvidia-smi` showed real CPU/GPU activity throughout both times, so it
+wasn't hung, just slow — plausibly CUDA context re-initialization after an
+unclean kill of the previous process's context on the same GPU.
 
 **Practical implication**: don't assume the service can take traffic the
-instant `pm2 list` shows `online` after any restart. Poll `/health` (or add
-a PM2 `wait_ready`/health-check gate if this matters for your rollout) and
-give it up to a couple of minutes on a cold or post-crash start.
+instant `pm2 list` shows `online` after *any* restart, and especially not
+right after a crash (as opposed to a deliberate `pm2 restart`). Poll
+`/health` (or add a PM2 `wait_ready`/health-check gate if this matters for
+your rollout) and give it up to several minutes on a post-crash start
+before concluding something is actually wrong.
 
 ---
 
