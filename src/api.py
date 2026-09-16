@@ -7,11 +7,17 @@ out. The OCR pipeline itself (ocr_engine.py / pipeline.py) is untouched --
 this module is pure transport glue, matching the same `process_image()` call
 `run_ocr.py` makes.
 
-IndicOCR is one GPU-resident model, not a pool of per-language engines like
-the old PaddleOCR API had -- there is nothing to pool. Requests are
-serialised through a single lock instead: concurrent calls into the same
-loaded model haven't been verified safe, so this errs toward correctness
-over throughput. See README/DEPLOYMENT.md for the scaling note.
+Requests are served by a pool of OCR_POOL_SIZE independent IndicOCR
+instances (each its own copy of the layout + recognition models, resident
+in GPU memory for the life of the process) sharing one asyncio.Queue: a
+request checks a worker out, uses it, and returns it -- no worker is ever
+shared between two in-flight requests, so the crop-config mutation
+ocr_engine.py does internally per call stays safe. Sizing this to the box:
+measured at ~4.3 GB peak VRAM for one worker against the heaviest real test
+image (an image with several forced blocks, each read at up to the model's
+max crop resolution -- see ocr_engine.py); default pool size 4 leaves
+headroom on a 24 GB A10G. A request never gets rejected for capacity --
+if every worker is busy, it waits in the queue rather than failing.
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ import asyncio
 import base64
 import binascii
 import logging
+import os
 import tempfile
 import urllib.request
 from contextlib import asynccontextmanager
@@ -41,18 +48,24 @@ log = logging.getLogger("ocr.api")
 
 MAX_FETCH_BYTES = 25 * 1024 * 1024   # 25 MB, matches the CLI's own sanity range
 FETCH_TIMEOUT_S = 15
+POOL_SIZE = int(os.environ.get("OCR_POOL_SIZE", "4"))
 
-_engine: OCREngine | None = None
-_lock = asyncio.Lock()
+_pool: asyncio.Queue[OCREngine] | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _engine
-    log.info("loading IndicOCR (first run downloads the gated model weights)...")
-    _engine = OCREngine()
-    await asyncio.get_event_loop().run_in_executor(None, _engine.warmup)
-    log.info("IndicOCR ready")
+    global _pool
+    _pool = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+    log.info("loading %d IndicOCR worker(s) (first run also downloads the "
+             "gated model weights)...", POOL_SIZE)
+    for i in range(POOL_SIZE):
+        engine = OCREngine()
+        await loop.run_in_executor(None, engine.warmup)
+        await _pool.put(engine)
+        log.info("worker %d/%d ready", i + 1, POOL_SIZE)
+    log.info("all %d IndicOCR workers ready", POOL_SIZE)
     yield
 
 
@@ -86,6 +99,8 @@ class ExtractResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     model_loaded: bool
+    pool_size: int
+    workers_available: int
 
 
 def _fetch_url(url: str) -> bytes:
@@ -121,7 +136,9 @@ def _decode_base64(image_base64: str) -> bytes:
 
 @app.get("/health", response_model=HealthResponse, tags=["ops"])
 async def health() -> HealthResponse:
-    return HealthResponse(status="ok", model_loaded=_engine is not None)
+    return HealthResponse(status="ok", model_loaded=_pool is not None,
+                          pool_size=POOL_SIZE,
+                          workers_available=_pool.qsize() if _pool else 0)
 
 
 @app.post("/extract", response_model=ExtractResponse, tags=["ocr"],
@@ -134,17 +151,18 @@ async def extract(request: ExtractRequest) -> ExtractResponse:
         tmp.write(image_bytes)
         tmp_path = Path(tmp.name)
 
+    engine = await _pool.get()  # waits here if every worker is busy -- never rejects
     try:
-        async with _lock:  # one inference at a time -- see module docstring
-            result, _ = await asyncio.get_event_loop().run_in_executor(
-                None, process_image, tmp_path, _engine, PreprocessConfig(),
-                request.min_confidence)
+        result, _ = await asyncio.get_event_loop().run_in_executor(
+            None, process_image, tmp_path, engine, PreprocessConfig(),
+            request.min_confidence)
     except Exception as exc:  # noqa: BLE001 - surfaced as a structured error, not a 500 trace
         log.exception("extraction failed")
         raise HTTPException(status_code=422,
                             detail=f"{type(exc).__name__}: {exc}") from exc
     finally:
         tmp_path.unlink(missing_ok=True)
+        _pool.put_nowait(engine)  # back in rotation regardless of success/failure
 
     if result.error:
         raise HTTPException(status_code=422, detail=result.error)

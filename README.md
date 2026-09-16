@@ -20,6 +20,11 @@ recognition-model pairing to manage.
 Outputs per image: reading-ordered Markdown, per-block layout label and
 confidence, bounding boxes, and total processing time.
 
+Two ways to run this: the CLI below (`run_ocr.py`, one-off / batch jobs
+against local files), or as an **HTTP API** for another application to call
+— see [API.md](API.md) for the integration contract and [DEPLOYMENT.md](DEPLOYMENT.md)
+for running it under PM2 in production.
+
 ---
 
 ## Quick start

@@ -5,6 +5,7 @@ download the gated model)."""
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import sys
 import unittest
@@ -29,13 +30,25 @@ class FakeEngine(OCREngine):
         return [TextBlock("HELLO", 0.9, [0, 0, w, h], 0, "Paragraph", "Text")], "HELLO"
 
 
+class FailingFakeEngine(FakeEngine):
+    def run(self, image):
+        raise ValueError("boom")
+
+
+def _pool_of(*engines: OCREngine) -> asyncio.Queue:
+    pool = asyncio.Queue()
+    for engine in engines:
+        pool.put_nowait(engine)
+    return pool
+
+
 def _sample_jpeg_bytes() -> bytes:
     return cv2.imencode(".jpg", np.full((80, 120, 3), 255, np.uint8))[1].tobytes()
 
 
 class ExtractEndpointTests(unittest.TestCase):
     def setUp(self):
-        api._engine = FakeEngine()  # skips the real lifespan / model download entirely
+        api._pool = _pool_of(FakeEngine())  # skips the real lifespan / model download entirely
         self.client = TestClient(api.app)
 
     def test_extract_via_base64_returns_success_envelope(self):
@@ -70,7 +83,30 @@ class ExtractEndpointTests(unittest.TestCase):
     def test_health_reports_model_loaded(self):
         resp = self.client.get("/health")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json(), {"status": "ok", "model_loaded": True})
+        body = resp.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertTrue(body["model_loaded"])
+        self.assertEqual(body["workers_available"], 1)
+
+    def test_worker_is_returned_to_pool_after_success(self):
+        payload = {"image_base64": base64.b64encode(_sample_jpeg_bytes()).decode()}
+        self.client.post("/extract", json=payload)
+        self.assertEqual(self.client.get("/health").json()["workers_available"], 1)
+
+    def test_worker_is_returned_to_pool_after_failure(self):
+        api._pool = _pool_of(FailingFakeEngine())
+        payload = {"image_base64": base64.b64encode(_sample_jpeg_bytes()).decode()}
+        resp = self.client.post("/extract", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(self.client.get("/health").json()["workers_available"], 1)
+
+    def test_two_requests_share_a_two_worker_pool_without_failing(self):
+        api._pool = _pool_of(FakeEngine(), FakeEngine())
+        payload = {"image_base64": base64.b64encode(_sample_jpeg_bytes()).decode()}
+        for _ in range(2):
+            resp = self.client.post("/extract", json=payload)
+            self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.client.get("/health").json()["workers_available"], 2)
 
 
 if __name__ == "__main__":
