@@ -186,53 +186,81 @@ choice, not an oversight:
 
 ## 8. Concurrency / worker pool sizing
 
-`src/api.py` holds `OCR_POOL_SIZE` (default `4`, env-overridable) independent
-IndicOCR instances in memory, each a full copy of the layout + recognition
-models. A request checks one out of an `asyncio.Queue`, uses it exclusively,
-and returns it when done — so requests *never fail for capacity reasons*;
-beyond `OCR_POOL_SIZE` concurrent requests, the rest simply wait their turn
-in the queue.
+`src/api.py` holds `OCR_POOL_SIZE` independent IndicOCR instances in memory,
+each a full copy of the layout + recognition models. A request checks one
+out of an `asyncio.Queue`, uses it exclusively, and returns it when done —
+so requests *never fail for capacity reasons*; beyond `OCR_POOL_SIZE`
+concurrent requests, the rest simply wait their turn in the queue.
 
-### How 4 was chosen, not assumed
+**Default is `1`, deliberately, on this single-GPU box.** More GPU-resident
+worker instances is the obvious lever to reach for and it was tried first —
+it measured *worse*, not better. What follows is the actual measurement,
+not a guess.
 
-Measured live on `acb`, not estimated from spec sheets:
+### The experiment that set the default
 
-```bash
-# GPU memory watcher, running throughout
-( while true; do nvidia-smi --query-gpu=memory.used,utilization.gpu \
-    --format=csv,noheader,nounits; sleep 1; done ) > /tmp/gpu_watch.log &
-
-# Then fired the heaviest real test image against a single running worker
-curl -X POST http://localhost:8000/extract -d @heaviest_test_payload.json ...
-```
+First measured one worker's footprint against the heaviest real test image
+(several forced blocks, each read at up to the model's max crop resolution
+— see `src/ocr_engine.py`):
 
 | | VRAM |
 |---|---|
 | Idle, one worker loaded | 3509 MiB |
-| Peak, one worker mid-request (heaviest test image — several forced blocks, each read at up to the model's max crop resolution) | 4345 MiB |
+| Peak, mid-request | 4345 MiB |
+| Idle, four workers loaded | 8491 MiB (≈1660 MiB/extra worker, not 3509 — they're separate Python objects in one process, sharing one CUDA context) |
 | A10G total | 23028 MiB |
 
-All `OCR_POOL_SIZE` workers are separate Python objects **inside the same
-process**, not separate OS processes, so they share one CUDA context
-instead of paying its ~1 GB-ish overhead per worker again — actual total
-usage for 4 workers should land below a naive `4 × 4345 MiB`, though this
-wasn't independently re-measured at full pool size beyond confirming the
-service starts, stays under the 23 GB ceiling, and serves correctly (§6).
-Re-run the same `nvidia-smi` watch during a burst of `OCR_POOL_SIZE`+
-concurrent requests before raising `OCR_POOL_SIZE` further on this box, or
-before deploying to a smaller GPU.
+Memory said 4 workers fit comfortably. Then 4 identical concurrent requests
+were fired at a 4-worker pool and, separately, at a 1-worker pool (`ab`-style
+parallel `curl`, wall-clock timed):
+
+| Pool size | Per-request time | Total wall time for 4 requests |
+|---|---|---|
+| 4 workers, run concurrently | ~75s **each** (vs. ~11.6s solo — 6.5x slower) | ~75.7s |
+| 1 worker, requests queue | 12s / 24s / 36s / 48s (staggered, FIFO) | ~47.8s |
+
+**One worker, serving requests one at a time, finished the same batch of
+work 37% faster than four workers processing it "in parallel."** A single
+GPU without NVIDIA MPS does not give independent CUDA contexts real
+compute parallelism — they context-switch and contend for the same SMs, so
+the extra workers bought contention, not throughput. Memory headroom was
+never the constraint; GPU compute was, and splitting it four ways per
+request made every request slower without finishing the batch any sooner.
+
+### What this means for "maximum throughput"
+
+On this hardware, the ceiling is **one image at a time, ~11.6s/image on the
+A10G** (more if it has several forced blocks). The worker-pool machinery
+still does real work at `OCR_POOL_SIZE=1`: it's why a burst of requests
+queues in fair FIFO order and *none of them fail*, which was the other half
+of the requirement. Raising `OCR_POOL_SIZE` above 1 only makes sense if:
+
+- this ever runs across **multiple GPUs** — one worker pinned per GPU would
+  give real parallelism (not implemented; the pool has no GPU-affinity
+  logic today, so multiple workers today all fight over GPU 0), or
+- IndicOCR's recogniser gains a genuine **batched-inference** path (several
+  images in one forward pass) — a real engineering project of its own, not
+  a config change, and out of scope here per "avoid unnecessary changes to
+  extraction logic."
+
+Neither is true on `acb` today. If throughput below ~11.6s/image is a hard
+requirement, the actual lever is a bigger/multi-GPU instance or batched
+inference, not more workers on this one.
 
 ### Changing it
 
 ```bash
 # In ecosystem.config.js, under env:
-env: { PORT: "8000", OCR_POOL_SIZE: "6" }
+env: { PORT: "8000", OCR_POOL_SIZE: "2" }
 ```
 
-Startup time scales roughly linearly with pool size — each worker loads and
-warms up in turn (sequential by design, to avoid every worker's initial CUDA
-allocation contending at once). Expect `OCR_POOL_SIZE` × (single-worker load
-time) before `/health` reports `model_loaded: true` on a cold start.
+then `pm2 delete social-media-ocr-api && pm2 start ecosystem.config.js` —
+plain `pm2 restart --update-env` was observed to sometimes keep serving the
+*previous* env's pool size on this box; delete+start is the reliable way to
+change it. Startup time scales roughly linearly with pool size (each worker
+loads and warms up in turn, sequentially, to avoid every worker's initial
+CUDA allocation contending at once) — expect `OCR_POOL_SIZE` × (single-worker
+load time, ~15-35s) before `/health` reports `model_loaded: true`.
 
 ---
 

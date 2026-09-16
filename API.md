@@ -49,14 +49,15 @@ curl http://98.86.63.69:8000/health
 ```
 
 ```json
-{ "status": "ok", "model_loaded": true, "pool_size": 4, "workers_available": 3 }
+{ "status": "ok", "model_loaded": true, "pool_size": 1, "workers_available": 1 }
 ```
 
 `pool_size` is the number of independent OCR workers held in memory
-(`OCR_POOL_SIZE` env var, default 4 — see `DEPLOYMENT.md`). `workers_available`
-is how many are idle right now; if it's `0`, incoming requests are queuing
-rather than failing (see Processing behavior below). Always `200` if the
-process is up at all.
+(`OCR_POOL_SIZE` env var, default **1** — deliberately; see `DEPLOYMENT.md`'s
+Concurrency section for why more workers measured *slower* on this single
+GPU, not faster). `workers_available` is how many are idle right now; if
+it's `0`, incoming requests are queuing rather than failing (see Processing
+behavior below). Always `200` if the process is up at all.
 
 ### `POST /extract`
 
@@ -170,18 +171,18 @@ Field notes:
 
 ## Processing behavior
 
-- **A pool of workers, not one.** `OCR_POOL_SIZE` (default 4) independent
-  IndicOCR instances share the GPU, each fully capable of handling a
-  request end to end. A request checks a worker out of an internal queue,
-  uses it, and returns it — if all workers are busy, the request **waits in
-  the queue, it does not get rejected**. There is no capacity-based error
-  response; the only failures are per-request (bad image, unreachable URL).
-- Plan for roughly **4-12 seconds per image** per worker (measured on an
-  A10G; more if the image has several
+- **Requests queue, they don't fail, under load.** The service processes
+  one image at a time by default (`OCR_POOL_SIZE=1` — see `DEPLOYMENT.md`:
+  on a single GPU, more concurrent model instances measured *slower*
+  overall than one at a time, not faster, so this is deliberate rather than
+  a limitation to work around). A burst of requests queues in FIFO order;
+  none of them get an error response for the server being busy.
+- Plan for roughly **4-12 seconds per image**, one at a time (measured on
+  an A10G; more if the image has several
   Image/Header/Footer/Chart/Diagram/Advertisement-labeled regions, since
-  each of those is read twice — see `src/ocr_engine.py`). With the default
-  pool of 4, up to 4 images process genuinely concurrently before a 5th
-  request starts queuing.
+  each of those is read twice — see `src/ocr_engine.py`). A batch of N
+  requests takes roughly N × that, not less — there is no parallel
+  speedup on this deployment.
 - **No request timeout is enforced by this service** beyond what your HTTP
   client sets. Set a client-side timeout that accounts for queue depth
   under load, not just one image's processing time — e.g. 60s covers a

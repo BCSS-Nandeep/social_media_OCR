@@ -12,12 +12,23 @@ instances (each its own copy of the layout + recognition models, resident
 in GPU memory for the life of the process) sharing one asyncio.Queue: a
 request checks a worker out, uses it, and returns it -- no worker is ever
 shared between two in-flight requests, so the crop-config mutation
-ocr_engine.py does internally per call stays safe. Sizing this to the box:
-measured at ~4.3 GB peak VRAM for one worker against the heaviest real test
-image (an image with several forced blocks, each read at up to the model's
-max crop resolution -- see ocr_engine.py); default pool size 4 leaves
-headroom on a 24 GB A10G. A request never gets rejected for capacity --
-if every worker is busy, it waits in the queue rather than failing.
+ocr_engine.py does internally per call stays safe. A request never gets
+rejected for capacity -- if every worker is busy, it waits in the queue
+rather than failing.
+
+DEFAULT IS 1, DELIBERATELY, ON A SINGLE-GPU BOX. It's tempting to assume
+more worker instances means more throughput; measured against this A10G it
+is the opposite. Firing 4 concurrent requests at a 4-worker pool took 75s
+total (each request individually took ~75s, i.e. ~6.5x its solo time);
+the identical 4 requests against a 1-worker pool (pure FIFO queueing) took
+47s total, each finishing in its own ~12s turn. A single GPU without MPS
+does not give independent CUDA contexts real parallelism for compute-bound
+work -- they context-switch and contend for the same SMs, so concurrent
+"workers" here bought nothing but overhead. Raise OCR_POOL_SIZE above 1
+only if this ever runs across multiple GPUs (one worker per GPU) or the
+recogniser gains a real batched-inference path; on one GPU it will make
+things slower, not faster. See DEPLOYMENT.md's Concurrency section for the
+measurements this is based on.
 """
 
 from __future__ import annotations
@@ -48,7 +59,7 @@ log = logging.getLogger("ocr.api")
 
 MAX_FETCH_BYTES = 25 * 1024 * 1024   # 25 MB, matches the CLI's own sanity range
 FETCH_TIMEOUT_S = 15
-POOL_SIZE = int(os.environ.get("OCR_POOL_SIZE", "4"))
+POOL_SIZE = int(os.environ.get("OCR_POOL_SIZE", "1"))
 
 _pool: asyncio.Queue[OCREngine] | None = None
 

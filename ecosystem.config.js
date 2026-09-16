@@ -10,7 +10,10 @@ module.exports = {
       autorestart: true,
       max_restarts: 10,
       restart_delay: 3000,
-      env: { PORT: "8000", OCR_POOL_SIZE: "4" },  // see DEPLOYMENT.md's Concurrency section
+      // OCR_POOL_SIZE=1 deliberately: measured slower, not faster, with more
+      // workers on this single GPU (real compute contention, not a config
+      // issue) -- see DEPLOYMENT.md's Concurrency section before raising it.
+      env: { PORT: "8000", OCR_POOL_SIZE: "1" },
     },
   ],
 };
