@@ -85,6 +85,32 @@ def _merge_reads(base: str, extra: str) -> str:
     return f"{base}\n{kept}" if kept else base
 
 
+# Forcing OCR onto a block IndicOCR's own pipeline would have left as a photo
+# is exactly the case its docs call out as inviting hallucination -- and
+# tested against a real poster, that is what happened: the recogniser
+# returned "[Image of a uniform civil code (UCC) screen with a screen above
+# it]" instead of transcribing. A whole line self-contained in one bracket
+# pair, long enough to be a generated description rather than a short
+# bracketed promo ("[LIMITED OFFER]" survives), or an explicit
+# "image of"/"photo of" opener, is dropped from forced blocks only --
+# legitimately transcribed blocks aren't at risk of this failure mode.
+_CAPTION_OPENERS = ("image of", "photo of", "picture of", "screenshot of",
+                    "this image", "the image", "an image of", "a photo of")
+
+
+def _is_hallucinated_caption(line: str) -> bool:
+    stripped = line.strip()
+    wrapped = ((stripped.startswith("[") and stripped.endswith("]")) or
+              (stripped.startswith("(") and stripped.endswith(")")))
+    if wrapped and len(stripped.split()) > 4:
+        return True
+    return stripped.lower().startswith(_CAPTION_OPENERS)
+
+
+def _strip_hallucinated_captions(text: str) -> str:
+    return "\n".join(line for line in text.splitlines() if not _is_hallucinated_caption(line))
+
+
 @dataclass
 class TextBlock:
     """One detected layout block and its transcription.
@@ -285,6 +311,7 @@ class OCREngine:
             label, block_type = original[b.order]
             text = b.text or ""
             if b.order in forced_orders and text:
+                text = _strip_hallucinated_captions(text)
                 text = _dedup_forced_text(text, known_lines)
             blocks.append(TextBlock(text, float(b.conf), [float(v) for v in b.bbox_xyxy],
                                     int(b.order), label, block_type))

@@ -19,7 +19,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.exporter import OCRResult, export, write_batch_summary  # noqa: E402
-from src.ocr_engine import OCREngine, TextBlock                  # noqa: E402
+from src.ocr_engine import (OCREngine, TextBlock,                # noqa: E402
+                            _is_hallucinated_caption, _strip_hallucinated_captions)
 from src.pipeline import process_image                           # noqa: E402
 from src.preprocess import (PreprocessConfig, enhance_contrast,  # noqa: E402
                             fix_orientation, load_image, resize_for_ocr)
@@ -168,6 +169,22 @@ class ForceOCRTests(unittest.TestCase):
         self.assertEqual(result[0].text, "")
         self.assertEqual(markdown, "")
 
+    def test_hallucinated_caption_is_stripped_from_forced_block_output(self):
+        # The actual string a real poster produced once forced.
+        blocks = [FakeBlock(0, "Image", "Picture", [0, 0, 300, 400], 0.9)]
+        engine, _ = _stub_engine(blocks, {
+            0: "UCC WILL BE IMPLEMENTED\n"
+               "[Image of a uniform civil code (UCC) screen with a screen above it]"
+        })
+        result, _ = engine.run(np.full((400, 300, 3), 255, np.uint8))
+        self.assertEqual(result[0].text, "UCC WILL BE IMPLEMENTED")
+
+    def test_short_bracketed_promo_text_survives(self):
+        blocks = [FakeBlock(0, "Image", "Picture", [0, 0, 300, 400], 0.9)]
+        engine, _ = _stub_engine(blocks, {0: "[LIMITED OFFER]"})
+        result, _ = engine.run(np.full((400, 300, 3), 255, np.uint8))
+        self.assertEqual(result[0].text, "[LIMITED OFFER]")
+
     def test_forced_text_deduped_against_already_transcribed_blocks(self):
         # Mirrors a real poster: a giant "Image" region the layout stage never
         # meant to transcribe turned out to span two paragraphs already read
@@ -192,6 +209,25 @@ class ForceOCRTests(unittest.TestCase):
         self.assertEqual(ocr.seen[0][2], "normal")
         self.assertEqual(ocr.seen[1][2], "normal")
         self.assertEqual(ocr.seen[2][2], "forced")
+
+
+class CaptionHeuristicTests(unittest.TestCase):
+    def test_long_bracketed_description_flagged(self):
+        self.assertTrue(_is_hallucinated_caption(
+            "[Image of a uniform civil code (UCC) screen with a screen above it]"))
+
+    def test_caption_opener_without_brackets_flagged(self):
+        self.assertTrue(_is_hallucinated_caption("Image of a man giving a speech"))
+
+    def test_short_bracketed_promo_not_flagged(self):
+        self.assertFalse(_is_hallucinated_caption("[LIMITED OFFER]"))
+
+    def test_ordinary_poster_line_not_flagged(self):
+        self.assertFalse(_is_hallucinated_caption("UCC WILL BE IMPLEMENTED"))
+
+    def test_strip_keeps_only_non_caption_lines(self):
+        text = "REAL LINE ONE\n[Image of something described at length]\nREAL LINE TWO"
+        self.assertEqual(_strip_hallucinated_captions(text), "REAL LINE ONE\nREAL LINE TWO")
 
 
 class PreprocessTests(unittest.TestCase):
