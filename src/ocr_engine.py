@@ -74,6 +74,17 @@ def _dedup_forced_text(text: str, known_lines: list[str]) -> str:
     return "\n".join(kept)
 
 
+def _merge_reads(base: str, extra: str) -> str:
+    """Union two recognizer reads of the same block, keeping every line from
+    `base` plus whatever `extra` adds that isn't already covered there."""
+    if not extra:
+        return base
+    if not base:
+        return extra
+    kept = _dedup_forced_text(extra, base.splitlines())
+    return f"{base}\n{kept}" if kept else base
+
+
 @dataclass
 class TextBlock:
     """One detected layout block and its transcription.
@@ -243,14 +254,25 @@ class OCREngine:
 
             page_blocks = list(ocr_model.run(tmp_path, normal_layout).blocks)
             if forced_layout.blocks:
-                # Forced blocks get the model's max supported crop resolution
-                # instead of the vendor's document-tuned default -- see the
-                # comment on _force_crop_config in _build().
+                # Forced blocks are read twice, at two crop resolutions, and
+                # merged -- not replaced. Measured on a real poster, the
+                # vendor's document-tuned default resolution and the model's
+                # own max resolution surfaced genuinely different text from
+                # the same block (one had the price line, the other had the
+                # masthead), so picking either loses real content.
+                forced_default = ocr_model.run(tmp_path, forced_layout).blocks
+
                 default_crop, ocr_model.crop = ocr_model.crop, self._force_crop_config
                 try:
-                    page_blocks += ocr_model.run(tmp_path, forced_layout).blocks
+                    forced_highres = {b.order: b
+                                      for b in ocr_model.run(tmp_path, forced_layout).blocks}
                 finally:
                     ocr_model.crop = default_crop
+
+                for b in forced_default:
+                    hi = forced_highres.get(b.order)
+                    b.text = _merge_reads(b.text or "", (hi.text or "") if hi else "")
+                page_blocks += forced_default
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 

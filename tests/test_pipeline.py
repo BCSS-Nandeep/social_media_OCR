@@ -75,26 +75,29 @@ class FakeLayoutModel:
 class FakeOCRModel:
     """Stands in for IndicBlockOCR: records what label/type/crop-config each block
     had when it was handed to the recogniser, then returns fixed text keyed by
-    block order."""
+    block order -- optionally a different text at the high-res crop config, to
+    simulate the two resolutions reading genuinely different content."""
 
-    def __init__(self, text_by_order, crop="normal"):
+    def __init__(self, text_by_order, text_by_order_forced=None, crop="normal"):
         self.text_by_order = text_by_order
+        self.text_by_order_forced = text_by_order_forced or {}
         self.crop = crop
         self.seen: dict[int, tuple[str, str, object]] = {}
 
     def run(self, path, layout):
+        source = self.text_by_order_forced if self.crop == "forced" else self.text_by_order
         out = []
         for b in layout.blocks:
             self.seen[b.order] = (b.label, b.type, self.crop)
             out.append(FakeBlock(b.order, b.label, b.type, b.bbox_xyxy, b.conf,
-                                 self.text_by_order.get(b.order, "")))
+                                 source.get(b.order, self.text_by_order.get(b.order, ""))))
         return FakePage(blocks=out)
 
 
-def _stub_engine(blocks, text_by_order) -> tuple[OCREngine, FakeOCRModel]:
+def _stub_engine(blocks, text_by_order, text_by_order_forced=None) -> tuple[OCREngine, FakeOCRModel]:
     engine = OCREngine()
     engine._layout_model = FakeLayoutModel(blocks)
-    ocr = FakeOCRModel(text_by_order)
+    ocr = FakeOCRModel(text_by_order, text_by_order_forced)
     engine._ocr_model = ocr
     engine._page_result_cls = FakePage
     engine._force_crop_config = "forced"
@@ -143,6 +146,20 @@ class ForceOCRTests(unittest.TestCase):
         engine.run(np.full((400, 300, 3), 255, np.uint8))
         # Ran through the normal-resolution pass, never touching the forced one.
         self.assertEqual(ocr.seen[0], ("Paragraph", "Text", "normal"))
+
+    def test_default_and_high_res_reads_are_merged_not_replaced(self):
+        # Mirrors what actually happened on a real poster: the default-res
+        # pass found the price line, the max-res pass found the masthead
+        # instead -- neither read was a superset of the other.
+        blocks = [FakeBlock(0, "Image", "Picture", [0, 0, 300, 400], 0.9)]
+        engine, _ = _stub_engine(
+            blocks,
+            text_by_order={0: "RS 450000/-\nPER 100 SQYD"},
+            text_by_order_forced={0: "HYDERABAD DECCAN NEWS\nHDN"},
+        )
+        result, markdown = engine.run(np.full((400, 300, 3), 255, np.uint8))
+        self.assertIn("RS 450000/-", result[0].text)
+        self.assertIn("HYDERABAD DECCAN NEWS", result[0].text)
 
     def test_untranscribed_forced_block_stays_empty(self):
         blocks = [FakeBlock(0, "Image", "Picture", [0, 0, 300, 400], 0.9)]
