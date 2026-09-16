@@ -16,9 +16,7 @@ class OCRResult:
     image_path: str
     image_size: tuple[int, int]          # (width, height) of the original image
     blocks: list[TextBlock]
-    line_numbers: list[int]
-    text: str
-    langs: list[str]
+    text: str                            # reading-ordered Markdown from IndicOCR
     preprocessing: list[str]
     timings: dict[str, float]            # seconds, per stage
     dropped_low_confidence: int = 0
@@ -52,12 +50,10 @@ class OCRResult:
                 "height": self.image_size[1],
             },
             "settings": {
-                "languages": self.langs,
                 "preprocessing": self.preprocessing or ["none"],
             },
             "summary": {
                 "text_blocks_detected": self.block_count,
-                "lines_detected": len(set(self.line_numbers)),
                 "mean_confidence": round(self.mean_confidence, 4),
                 "min_confidence": round(self.min_confidence, 4),
                 "blocks_dropped_below_threshold": self.dropped_low_confidence,
@@ -65,8 +61,7 @@ class OCRResult:
                 "stage_times_sec": {k: round(v, 3) for k, v in self.timings.items()},
             },
             "full_text": self.text,
-            "blocks": [b.to_dict(i, ln) for i, (b, ln)
-                       in enumerate(zip(self.blocks, self.line_numbers))],
+            "blocks": [b.to_dict(i) for i, b in enumerate(self.blocks)],
             "error": self.error,
             **self.extra,
         }
@@ -78,20 +73,18 @@ def write_txt(result: OCRResult, path: Path) -> Path:
     header = [
         f"Image             : {Path(result.image_path).name}",
         f"Size              : {result.image_size[0]}x{result.image_size[1]}",
-        f"Languages         : {', '.join(result.langs)}",
         f"Preprocessing     : {', '.join(result.preprocessing) or 'none'}",
         f"Text blocks       : {result.block_count}",
         f"Mean confidence   : {result.mean_confidence:.4f}",
         f"Processing time   : {result.total_time:.3f} s",
         "=" * 68,
-        "EXTRACTED TEXT (reading order)",
+        "EXTRACTED TEXT (reading order, Markdown)",
         "=" * 68,
     ]
-    body = [result.text, "", "=" * 68, "PER-BLOCK CONFIDENCE", "=" * 68,
-            f"{'#':>4}  {'line':>4}  {'conf':>6}  {'model':>6}  text"]
-    for i, (block, line_no) in enumerate(zip(result.blocks, result.line_numbers)):
-        body.append(f"{i:>4}  {line_no:>4}  {block.confidence:>6.4f}  "
-                    f"{block.lang:>6}  {block.text}")
+    body = [result.text, "", "=" * 68, "PER-BLOCK DETAIL", "=" * 68,
+            f"{'#':>4}  {'label':<18} {'conf':>6}  text"]
+    for i, block in enumerate(result.blocks):
+        body.append(f"{i:>4}  {block.label:<18} {block.confidence:>6.4f}  {block.text}")
 
     path.write_text("\n".join(header + body) + "\n", encoding="utf-8")
     return path
@@ -106,10 +99,11 @@ def write_csv(result: OCRResult, path: Path) -> Path:
     # utf-8-sig so Excel renders Telugu instead of mojibake.
     with path.open("w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["index", "line", "text", "confidence", "lang_model",
+        writer.writerow(["index", "order", "label", "type", "text", "confidence",
                          "x_min", "y_min", "x_max", "y_max"])
-        for i, (block, line_no) in enumerate(zip(result.blocks, result.line_numbers)):
-            writer.writerow([i, line_no, block.text, f"{block.confidence:.4f}", block.lang,
+        for i, block in enumerate(result.blocks):
+            writer.writerow([i, block.order, block.label, block.block_type, block.text,
+                             f"{block.confidence:.4f}",
                              round(block.x_min, 1), round(block.y_min, 1),
                              round(block.x_max, 1), round(block.y_max, 1)])
     return path

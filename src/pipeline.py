@@ -8,7 +8,6 @@ from pathlib import Path
 from .exporter import OCRResult
 from .ocr_engine import OCREngine
 from .preprocess import PreprocessConfig, load_image, preprocess
-from .reading_order import order_blocks, render_text
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
@@ -37,29 +36,21 @@ def process_image(path: Path, engine: OCREngine, pre_config: PreprocessConfig,
     timings["preprocess"] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    blocks, per_lang = engine.run(image)
+    blocks, markdown = engine.run(image)
     timings["ocr"] = time.perf_counter() - t0
-    timings.update({f"ocr:{lang}": secs for lang, secs in per_lang.items()})
 
     # Boxes come back in preprocessed-image space; report original coordinates.
     blocks = [b.scaled(scale) for b in blocks]
 
     kept = [b for b in blocks if b.confidence >= min_confidence]
     dropped = len(blocks) - len(kept)
-
-    t0 = time.perf_counter()
-    ordered, line_numbers = order_blocks(kept)
-    text = render_text(ordered, line_numbers)
-    timings["ordering"] = time.perf_counter() - t0
     timings["total"] = time.perf_counter() - started
 
     result = OCRResult(
         image_path=str(path),
         image_size=(width, height),
-        blocks=ordered,
-        line_numbers=line_numbers,
-        text=text,
-        langs=engine.langs,
+        blocks=kept,
+        text=markdown,
         preprocessing=applied,
         timings=timings,
         dropped_low_confidence=dropped,

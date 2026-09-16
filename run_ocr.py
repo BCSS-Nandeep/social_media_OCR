@@ -1,10 +1,10 @@
 #!/usr/bin/env python
-"""PaddleOCR text extraction for Instagram / social-media poster images.
+"""IndicOCR text extraction for Instagram / social-media poster images.
 
 Examples
 --------
     python run_ocr.py data/input/poster.jpg
-    python run_ocr.py data/input --lang te+en --formats txt json csv
+    python run_ocr.py data/input --formats txt json csv
     python run_ocr.py poster.png --enhance-contrast --resize --visualize
 """
 
@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Extract text from poster images with PaddleOCR.",
+        description="Extract text from poster images with IndicOCR.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -33,47 +33,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Image file, or a directory of images (searched recursively).")
     p.add_argument("-o", "--output-dir", type=Path, default=ROOT / "outputs",
                    help="Where to write results (default: ./outputs).")
-    p.add_argument("--lang", default="te",
-                   help="Recognition language(s), '+'-separated. 'te'=Telugu "
-                        "(default), 'en'=English, 'te+en'=both passes merged. "
-                        "The Telugu model reads embedded English too, so 'te+en' "
-                        "measured no better than 'te' alone while taking ~3.7x "
-                        "longer -- use it only for English-dominant images.")
     p.add_argument("--formats", nargs="+", default=["txt", "json"],
                    choices=["txt", "json", "csv"],
                    help="Export formats (default: txt json).")
+    p.add_argument("--table-format", default="html", choices=["html", "markdown"],
+                   help="How detected tables render in the output Markdown. "
+                        "html (default) preserves merged cells; markdown is smaller "
+                        "but flattens them.")
     p.add_argument("--min-confidence", type=float, default=0.0,
-                   help="Drop text blocks scoring below this (0-1). Default 0 = keep all, "
-                        "including PaddleOCR's own internally-filtered low scores.")
-    p.add_argument("--det-box-thresh", type=float, default=0.5,
-                   help="Detector box threshold; lower finds more/fainter text. Default 0.5.")
-    p.add_argument("--det-limit", type=int, default=960,
-                   help="Max side length the detector sees; larger images are "
-                        "downscaled to this before detection. Default 960 (PaddleOCR's own).")
-    p.add_argument("--unclip", type=float, default=1.5,
-                   help="Box inflation before recognition cropping. Default 1.5.")
-    p.add_argument("--det-model", default=None, metavar="NAME",
-                   help="Detection model name. Default PP-OCRv6_medium_det "
-                        "(+8.5 accuracy points and faster than the stock v5 "
-                        "detector).")
-    # A dedicated flag rather than `--det-model ""`: PowerShell drops empty
-    # string arguments before the process sees them, so the quoted-empty form
-    # silently turns into a parse error on the shell most users are on.
-    p.add_argument("--legacy-det", action="store_true",
-                   help="Use PaddleOCR's own lang-default detector (PP-OCRv5) "
-                        "instead of PP-OCRv6.")
-    # Default OFF. The textline orientation classifier is trained on document
-    # scans; on poster art it misfires badly and rotates upright lines 180
-    # degrees, after which recognition returns garbage. Measured on the
-    # ground-truth set it cost 17 points of document accuracy overall and 35
-    # on the worst image. Detection is unaffected -- block counts are identical
-    # either way, so the damage is purely to the crops fed to recognition.
-    p.add_argument("--angle-cls", action="store_true",
-                   help="Enable the 180-degree text-line orientation classifier. "
-                        "Off by default: it misfires on poster text and cost 17 "
-                        "points of accuracy on the sample set. Turn on only for "
-                        "images with genuinely upside-down text.")
-    p.add_argument("--gpu", action="store_true", help="Use GPU (needs paddlepaddle-gpu).")
+                   help="Drop layout blocks scoring below this (0-1). This is "
+                        "IndicDocLayout's detection confidence, not a transcription "
+                        "score -- IndicOCR does not expose one separately. Default 0 "
+                        "= keep everything detected, including untranscribed blocks "
+                        "like Image/Header/Footer.")
     p.add_argument("--visualize", action="store_true",
                    help="Also write an annotated image with boxes and confidences.")
     p.add_argument("--quiet", action="store_true", help="Suppress per-block console output.")
@@ -95,23 +67,18 @@ def report(result: OCRResult, quiet: bool) -> None:
         print(f"  [FAILED] {name}: {result.error}")
         return
 
-    print(f"  blocks={result.block_count}  lines={len(set(result.line_numbers))}  "
-          f"mean_conf={result.mean_confidence:.4f}  time={result.total_time:.3f}s")
+    print(f"  blocks={result.block_count}  mean_conf={result.mean_confidence:.4f}  "
+          f"time={result.total_time:.3f}s")
     if result.dropped_low_confidence:
         print(f"  dropped below threshold: {result.dropped_low_confidence}")
     if quiet:
         return
-    for i, (block, line_no) in enumerate(zip(result.blocks, result.line_numbers)):
-        print(f"    [{i:>3}] L{line_no:<3} {block.confidence:.4f}  {block.text}")
+    for i, block in enumerate(result.blocks):
+        print(f"    [{i:>3}] {block.label:<18} {block.confidence:.4f}  {block.text}")
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-
-    langs = [x.strip() for x in args.lang.split("+") if x.strip()]
-    if not langs:
-        print("error: --lang must name at least one language", file=sys.stderr)
-        return 2
 
     try:
         images = find_images(args.input)
@@ -129,18 +96,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print(f"Images       : {len(images)}")
-    print(f"Languages    : {' + '.join(langs)}")
+    print(f"Table format : {args.table_format}")
     print(f"Preprocessing: {'enabled' if pre_config.any_enabled else 'none'}")
-    print("Loading PaddleOCR models (first run downloads them)...")
+    print("Loading IndicOCR (first run downloads ~1.8GB of weights)...")
 
-    engine = OCREngine(langs, use_gpu=args.gpu,
-                       use_angle_cls=args.angle_cls,
-                       det_db_box_thresh=args.det_box_thresh,
-                       det_limit_side_len=args.det_limit,
-                       det_db_unclip_ratio=args.unclip,
-                       det_model="" if args.legacy_det else args.det_model,
-                       drop_score=0.0)  # filter once, in process_image, so the
-                                        # "dropped" count reflects reality
+    engine = OCREngine(table_format=args.table_format)
     engine.warmup()
 
     results: list[OCRResult] = []
@@ -151,7 +111,7 @@ def main(argv: list[str] | None = None) -> int:
                                               args.min_confidence)
         except Exception as exc:  # noqa: BLE001 - one bad image must not kill a batch
             traceback.print_exc(limit=2)
-            results.append(OCRResult(str(image_path), (0, 0), [], [], "", langs, [],
+            results.append(OCRResult(str(image_path), (0, 0), [], "", [],
                                      {"total": 0.0}, error=f"{type(exc).__name__}: {exc}"))
             report(results[-1], args.quiet)
             continue
