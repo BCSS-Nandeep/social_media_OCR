@@ -55,8 +55,11 @@ class FakeBlock:
 
 
 class FakePage:
-    def __init__(self, blocks):
-        self.blocks = blocks
+    """Stands in for IndicOCR's PageResult."""
+
+    def __init__(self, image="p", width=1, height=1, blocks=None):
+        self.image, self.width, self.height = image, width, height
+        self.blocks = blocks or []
 
 
 class FakeLayoutModel:
@@ -66,24 +69,26 @@ class FakeLayoutModel:
         self._blocks = blocks
 
     def detect(self, path):
-        return FakePage(self._blocks)
+        return FakePage(blocks=self._blocks)
 
 
 class FakeOCRModel:
-    """Stands in for IndicBlockOCR: records what label/type each block had when it
-    was handed to the recogniser, then returns fixed text keyed by block order."""
+    """Stands in for IndicBlockOCR: records what label/type/crop-config each block
+    had when it was handed to the recogniser, then returns fixed text keyed by
+    block order."""
 
-    def __init__(self, text_by_order):
+    def __init__(self, text_by_order, crop="normal"):
         self.text_by_order = text_by_order
-        self.seen: dict[int, tuple[str, str]] = {}
+        self.crop = crop
+        self.seen: dict[int, tuple[str, str, object]] = {}
 
     def run(self, path, layout):
         out = []
         for b in layout.blocks:
-            self.seen[b.order] = (b.label, b.type)
+            self.seen[b.order] = (b.label, b.type, self.crop)
             out.append(FakeBlock(b.order, b.label, b.type, b.bbox_xyxy, b.conf,
                                  self.text_by_order.get(b.order, "")))
-        return FakePage(out)
+        return FakePage(blocks=out)
 
 
 def _stub_engine(blocks, text_by_order) -> tuple[OCREngine, FakeOCRModel]:
@@ -91,6 +96,8 @@ def _stub_engine(blocks, text_by_order) -> tuple[OCREngine, FakeOCRModel]:
     engine._layout_model = FakeLayoutModel(blocks)
     ocr = FakeOCRModel(text_by_order)
     engine._ocr_model = ocr
+    engine._page_result_cls = FakePage
+    engine._force_crop_config = "forced"
     return engine, ocr
 
 
@@ -114,7 +121,14 @@ class ForceOCRTests(unittest.TestCase):
         blocks = [FakeBlock(0, "Image", "Picture", [0, 0, 300, 400], 0.9)]
         engine, ocr = _stub_engine(blocks, {0: "some text"})
         engine.run(np.full((400, 300, 3), 255, np.uint8))
-        self.assertEqual(ocr.seen[0], ("Paragraph", "Text"))
+        self.assertEqual(ocr.seen[0], ("Paragraph", "Text", "forced"))
+
+    def test_crop_config_is_swapped_for_forced_blocks_and_restored_after(self):
+        blocks = [FakeBlock(0, "Image", "Picture", [0, 0, 300, 400], 0.9)]
+        engine, ocr = _stub_engine(blocks, {0: "some text"})
+        engine.run(np.full((400, 300, 3), 255, np.uint8))
+        self.assertEqual(ocr.seen[0][2], "forced")   # ran with the high-res config
+        self.assertEqual(ocr.crop, "normal")          # restored after
 
     def test_original_label_and_type_are_restored_on_output(self):
         blocks = [FakeBlock(0, "Image", "Picture", [0, 0, 300, 400], 0.9)]
@@ -127,7 +141,8 @@ class ForceOCRTests(unittest.TestCase):
         blocks = [FakeBlock(0, "Paragraph", "Text", [0, 0, 300, 60], 0.9)]
         engine, ocr = _stub_engine(blocks, {0: "BIG SALE"})
         engine.run(np.full((400, 300, 3), 255, np.uint8))
-        self.assertEqual(ocr.seen[0], ("Paragraph", "Text"))
+        # Ran through the normal-resolution pass, never touching the forced one.
+        self.assertEqual(ocr.seen[0], ("Paragraph", "Text", "normal"))
 
     def test_untranscribed_forced_block_stays_empty(self):
         blocks = [FakeBlock(0, "Image", "Picture", [0, 0, 300, 400], 0.9)]
@@ -150,12 +165,16 @@ class ForceOCRTests(unittest.TestCase):
             1: "OPEN PLOTS NEAR SHAMSHABAD",
             2: "BIG SALE\nHIDDEN HEADLINE\nOPEN PLOTS NEAR SHAMSHABAD",
         }
-        engine, _ = _stub_engine(blocks, text_by_order)
+        engine, ocr = _stub_engine(blocks, text_by_order)
         result, markdown = engine.run(np.full((400, 300, 3), 255, np.uint8))
         forced = next(b for b in result if b.order == 2)
         self.assertEqual(forced.text, "HIDDEN HEADLINE")
         self.assertIn("HIDDEN HEADLINE", markdown)
         self.assertEqual(markdown.count("BIG SALE"), 1)
+        # Only the Image block went through the high-res pass.
+        self.assertEqual(ocr.seen[0][2], "normal")
+        self.assertEqual(ocr.seen[1][2], "normal")
+        self.assertEqual(ocr.seen[2][2], "forced")
 
 
 class PreprocessTests(unittest.TestCase):

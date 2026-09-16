@@ -142,6 +142,8 @@ class OCREngine:
         self.table_format = table_format
         self._layout_model = None
         self._ocr_model = None
+        self._force_crop_config = None  # built in _build(); needs CropConfig
+        self._page_result_cls = None    # ditto, needs PageResult
 
     def _build(self):
         try:
@@ -166,7 +168,7 @@ class OCREngine:
 
         try:
             from idp_offline import IndicBlockOCR, IndicDocLayout
-            from idp_types import RecognizerConfig, TableFormat
+            from idp_types import CropConfig, PageResult, RecognizerConfig, TableFormat
         except ImportError:
             # The model ships its own installer, which reads the local driver
             # and picks matching CUDA wheels for torch/transformers -- running
@@ -180,11 +182,25 @@ class OCREngine:
             subprocess.run(["bash", str(Path(repo) / "install.sh")],
                            check=True, cwd=repo, env=env)
             from idp_offline import IndicBlockOCR, IndicDocLayout
-            from idp_types import RecognizerConfig, TableFormat
+            from idp_types import CropConfig, PageResult, RecognizerConfig, TableFormat
+
+        self._page_result_cls = PageResult
 
         layout_model = IndicDocLayout(f"{repo}/weights/layout")
         ocr_model = IndicBlockOCR(f"{repo}/weights/ocr",
                                   config=RecognizerConfig(table_format=TableFormat(self.table_format)))
+
+        # A forced block (see FORCE_OCR_LABELS) is our hardest case by
+        # construction: a photo with a headline baked in routinely also
+        # carries much smaller embedded text -- a masthead, a book title --
+        # that a normally-sized crop doesn't give the model enough pixels to
+        # read. CropConfig.min_px_side is the vendor's own upscale trigger
+        # (area below it gets scaled up before recognition); pointing it at
+        # their own max_px_side asks for the model's full supported
+        # resolution on these blocks instead of guessing an upscale factor.
+        default_crop = CropConfig()
+        self._force_crop_config = CropConfig(min_px_side=default_crop.max_px_side)
+
         return layout_model, ocr_model
 
     @property
@@ -218,16 +234,32 @@ class OCREngine:
                 if b.order in forced_orders:
                     b.label, b.type = _FORCE_LABEL, _FORCE_TYPE
 
-            page = ocr_model.run(tmp_path, layout)
+            normal_layout = self._page_result_cls(
+                image=layout.image, width=layout.width, height=layout.height,
+                blocks=[b for b in layout.blocks if b.order not in forced_orders])
+            forced_layout = self._page_result_cls(
+                image=layout.image, width=layout.width, height=layout.height,
+                blocks=[b for b in layout.blocks if b.order in forced_orders])
+
+            page_blocks = list(ocr_model.run(tmp_path, normal_layout).blocks)
+            if forced_layout.blocks:
+                # Forced blocks get the model's max supported crop resolution
+                # instead of the vendor's document-tuned default -- see the
+                # comment on _force_crop_config in _build().
+                default_crop, ocr_model.crop = ocr_model.crop, self._force_crop_config
+                try:
+                    page_blocks += ocr_model.run(tmp_path, forced_layout).blocks
+                finally:
+                    ocr_model.crop = default_crop
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
         known_lines = [line.strip()
-                       for b in page.blocks if b.order not in forced_orders
+                       for b in page_blocks if b.order not in forced_orders
                        for line in (b.text or "").splitlines() if line.strip()]
 
         blocks = []
-        for b in sorted(page.blocks, key=lambda b: b.order):
+        for b in sorted(page_blocks, key=lambda b: b.order):
             label, block_type = original[b.order]
             text = b.text or ""
             if b.order in forced_orders and text:
