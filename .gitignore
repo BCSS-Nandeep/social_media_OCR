@@ -4,3 +4,4 @@ __pycache__/
 outputs/
 data/input/*
 !data/input/README.md
+.env

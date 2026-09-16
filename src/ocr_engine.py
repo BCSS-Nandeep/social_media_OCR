@@ -14,6 +14,7 @@ env var before the first download will succeed.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -119,9 +120,15 @@ class OCREngine:
         except ImportError:
             # The model ships its own installer, which reads the local driver
             # and picks matching CUDA wheels for torch/transformers -- running
-            # it here is what the model card's own setup instructions do.
+            # it here is what the model card's own setup instructions do. It
+            # installs into "whichever Python is active", so the venv this
+            # process is running in has to be first on PATH, or its `pip`
+            # calls resolve to the system Python and hit PEP 668's
+            # externally-managed-environment guard instead.
+            env = os.environ.copy()
+            env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
             subprocess.run(["bash", str(Path(repo) / "install.sh")],
-                           check=True, cwd=repo)
+                           check=True, cwd=repo, env=env)
             from indic_ocr import IndicOCR
 
         return IndicOCR.from_pretrained(repo, table_format=self.table_format)
