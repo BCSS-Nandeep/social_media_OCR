@@ -108,6 +108,12 @@ class ExtractEndpointTests(unittest.TestCase):
             self.assertEqual(resp.status_code, 200)
         self.assertEqual(self.client.get("/health").json()["workers_available"], 2)
 
+    def test_root_serves_html(self):
+        resp = self.client.get("/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("text/html", resp.headers.get("content-type", ""))
+        self.assertIn("IndicOCR", resp.text)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

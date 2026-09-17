@@ -48,7 +48,9 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 
 from .ocr_engine import OCREngine
@@ -85,6 +87,14 @@ app = FastAPI(
     description="Extracts text from social-media poster images via IndicOCR.",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -195,3 +205,8 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
     message = "; ".join(e["msg"] for e in exc.errors())
     return JSONResponse(status_code=422,
                         content=ExtractResponse(success=False, error=message).model_dump())
+
+
+PUBLIC_DIR = Path(__file__).resolve().parent.parent / "public"
+if PUBLIC_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(PUBLIC_DIR), html=True), name="public")

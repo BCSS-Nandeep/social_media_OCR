@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IndicOCR — Social Media Poster Text Extractor</title>
+  <meta name="description" content="Extract reading-ordered text from social media posters, infographics, and banners in Telugu, English, and Indian languages using IndicOCR." />
+  
+  <!-- Modern Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app-background">
+    <div class="glow glow-1"></div>
+    <div class="glow glow-2"></div>
+  </div>
+
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 7V4h16v3M9 20h6M12 4v16"/>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <div class="brand-title-row">
+            <h1>IndicOCR Studio</h1>
+            <span class="badge badge-accent">Telugu + Indian Scripts</span>
+          </div>
+          <p class="brand-subtitle">Social Media Poster & Banner Text Extractor with Reading Order</p>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <div id="serverStatus" class="status-indicator" title="Checking server status...">
+          <span class="status-dot"></span>
+          <span class="status-text">Checking API...</span>
+        </div>
+        <button id="settingsBtn" class="btn btn-ghost btn-icon" title="API Settings">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Settings Modal / Drawer (hidden by default) -->
+    <div id="settingsPanel" class="settings-panel hidden">
+      <div class="settings-header">
+        <h3>API Configuration</h3>
+        <button id="closeSettingsBtn" class="btn-close">&times;</button>
+      </div>
+      <div class="settings-body">
+        <label for="apiUrlInput">API Base URL</label>
+        <div class="input-with-action">
+          <input type="text" id="apiUrlInput" placeholder="http://localhost:8000" />
+          <button id="saveApiUrlBtn" class="btn btn-sm btn-primary">Save</button>
+        </div>
+        <p class="form-hint">Default connects to local server at <code>http://localhost:8000</code> or your deployment host.</p>
+      </div>
+    </div>
+
+    <!-- Main Workspace -->
+    <main class="workspace">
+      <!-- Input Panel -->
+      <section class="upload-section card">
+        <div class="section-top">
+          <div class="input-tabs">
+            <button id="tabFileBtn" class="tab-btn active">Upload Image</button>
+            <button id="tabUrlBtn" class="tab-btn">Image URL</button>
+          </div>
+          <div class="options-inline">
+            <label class="slider-label" for="minConfRange">
+              Min Confidence: <span id="confValue" class="badge badge-subtle">0.00</span>
+            </label>
+            <input type="range" id="minConfRange" min="0" max="1" step="0.05" value="0.0" />
+          </div>
+        </div>
+
+        <!-- File Upload View -->
+        <div id="dropZone" class="dropzone">
+          <input type="file" id="fileInput" accept="image/jpeg,image/png,image/webp,image/bmp,image/tiff" class="file-input-hidden" />
+          <div class="dropzone-inner">
+            <div class="dropzone-icon-ring">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="17 8 12 3 7 8"></polyline>
+                <line x1="12" y1="3" x2="12" y2="15"></line>
+              </svg>
+            </div>
+            <div class="dropzone-text">
+              <p class="dropzone-primary"><strong>Click to upload</strong> or drag and drop</p>
+              <p class="dropzone-secondary">PNG, JPG, WebP, BMP up to 25MB • You can also paste directly (Ctrl+V)</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- URL Input View (hidden by default) -->
+        <div id="urlInputContainer" class="url-input-container hidden">
+          <div class="input-group">
+            <span class="input-icon">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+              </svg>
+            </span>
+            <input type="url" id="imageUrlInput" placeholder="https://example.com/poster.jpg" />
+            <button id="loadUrlBtn" class="btn btn-secondary">Load URL</button>
+          </div>
+        </div>
+
+        <!-- Selected Image Preview Bar & Submit Button -->
+        <div id="previewBar" class="preview-bar hidden">
+          <div class="preview-meta">
+            <img id="thumbnailImg" src="" alt="Thumbnail" class="preview-thumb" />
+            <div class="preview-details">
+              <span id="previewName" class="preview-filename">poster.jpg</span>
+              <span id="previewSize" class="preview-filesize">0 KB</span>
+            </div>
+          </div>
+          <div class="preview-actions">
+            <button id="clearImageBtn" class="btn btn-ghost btn-sm" title="Remove image">Clear</button>
+            <button id="extractBtn" class="btn btn-primary btn-extract">
+              <span class="btn-spinner hidden" id="btnSpinner"></span>
+              <span class="btn-text" id="btnText">Extract Text</span>
+              <svg class="btn-arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="5" y1="12" x2="19" y2="12"></line>
+                <polyline points="12 5 19 12 12 19"></polyline>
+              </svg>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Error / Alert Message -->
+      <div id="alertBox" class="alert-box hidden">
+        <div class="alert-icon">⚠️</div>
+        <div class="alert-content">
+          <strong id="alertTitle">Error</strong>
+          <p id="alertMessage">Something went wrong.</p>
+        </div>
+        <button id="closeAlertBtn" class="btn-close">&times;</button>
+      </div>
+
+      <!-- Results View (hidden until processed) -->
+      <section id="resultsSection" class="results-section hidden">
+        <!-- Stats Strip -->
+        <div class="stats-strip card">
+          <div class="stat-item">
+            <span class="stat-label">Total Time</span>
+            <span id="statTime" class="stat-value">0.00s</span>
+          </div>
+          <div class="stat-divider"></div>
+          <div class="stat-item">
+            <span class="stat-label">Blocks Detected</span>
+            <span id="statBlocks" class="stat-value">0</span>
+          </div>
+          <div class="stat-divider"></div>
+          <div class="stat-item">
+            <span class="stat-label">Mean Confidence</span>
+            <span id="statConfidence" class="stat-value">0.0%</span>
+          </div>
+          <div class="stat-divider"></div>
+          <div class="stat-item">
+            <span class="stat-label">Resolution</span>
+            <span id="statDimensions" class="stat-value">0 × 0</span>
+          </div>
+        </div>
+
+        <!-- Two Column Results Grid -->
+        <div class="results-grid">
+          <!-- Left Column: Visual Image with Bounding Boxes -->
+          <div class="card visual-card">
+            <div class="card-header">
+              <div class="card-title-group">
+                <h3>Visual Layout & Bounding Boxes</h3>
+                <span class="tag-hint">Hover boxes to inspect</span>
+              </div>
+              <div class="canvas-controls">
+                <label class="checkbox-label" title="Toggle Bounding Boxes">
+                  <input type="checkbox" id="toggleBoxesCheck" checked />
+                  <span>Boxes</span>
+                </label>
+                <label class="checkbox-label" title="Toggle Box Labels">
+                  <input type="checkbox" id="toggleLabelsCheck" checked />
+                  <span>Labels</span>
+                </label>
+              </div>
+            </div>
+            
+            <div class="canvas-container" id="canvasContainer">
+              <div class="canvas-wrapper" id="canvasWrapper">
+                <img id="resultImage" alt="Analyzed document" />
+                <div id="boxOverlay" class="box-overlay"></div>
+              </div>
+            </div>
+
+            <!-- Legend for Layout Types -->
+            <div class="legend-row">
+              <span class="legend-chip legend-title">Title / Header</span>
+              <span class="legend-chip legend-para">Paragraph</span>
+              <span class="legend-chip legend-table">Table</span>
+              <span class="legend-chip legend-image">Image / Graphic</span>
+              <span class="legend-chip legend-other">Other</span>
+            </div>
+          </div>
+
+          <!-- Right Column: Text & Structured Blocks -->
+          <div class="card output-card">
+            <div class="output-tabs">
+              <button id="tabMarkdownBtn" class="output-tab-btn active">Extracted Text</button>
+              <button id="tabBlocksBtn" class="output-tab-btn">Blocks (<span id="blockTabCount">0</span>)</button>
+              <button id="tabJsonBtn" class="output-tab-btn">Raw JSON</button>
+
+              <div class="output-actions">
+                <button id="copyOutputBtn" class="btn btn-ghost btn-sm" title="Copy text to clipboard">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                  </svg>
+                  <span>Copy</span>
+                </button>
+                <button id="downloadJsonBtn" class="btn btn-ghost btn-sm" title="Download JSON file">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="7 10 12 15 17 10"></polyline>
+                    <line x1="12" y1="15" x2="12" y2="3"></line>
+                  </svg>
+                  <span>Download</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="output-tab-content">
+              <!-- Tab 1: Extracted Markdown Text -->
+              <div id="panelMarkdown" class="panel-view active">
+                <div class="text-content-wrapper">
+                  <pre id="extractedTextPre" class="extracted-text-pre"></pre>
+                </div>
+              </div>
+
+              <!-- Tab 2: Detected Blocks List -->
+              <div id="panelBlocks" class="panel-view">
+                <div id="blocksList" class="blocks-list"></div>
+              </div>
+
+              <!-- Tab 3: Raw JSON View -->
+              <div id="panelJson" class="panel-view">
+                <pre id="jsonViewerPre" class="json-viewer-pre"></pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
