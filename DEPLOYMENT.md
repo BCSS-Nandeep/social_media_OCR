@@ -325,6 +325,22 @@ cache while leaving IndicOCR (and headroom for its own request-time spikes)
 untouched. Raise it only after checking `nvidia-smi` for how much both
 processes are actually using, not from the total card size alone.
 
+**Known failure mode, actually hit and fixed here**: Qwen2.5-VL-7B-Instruct
+defaults to `max_model_len=128000` (128K context). vLLM sizes its KV-cache
+memory budget against that number, and at `--gpu-memory-utilization 0.6` the
+model's weights plus the *minimum* viable KV cache for a 128K context didn't
+fit -- vLLM crash-looped with `ValueError: No available memory for the
+cache blocks`, restarting every ~30-60s under PM2 until stopped manually.
+The fix was **not** raising `gpu_memory_utilization` further (that just
+delays hitting the same wall, and eats into IndicOCR's headroom); it was
+capping context to what this workload actually needs:
+`--max-model-len 16384` (`VLLM_MAX_MODEL_LEN` in `ecosystem.config.js`) --
+a handful of video frames plus a short prompt, one request at a time, needs
+nowhere near 128K tokens. Confirm which wall you're hitting before changing
+either knob: an OOM naming *weights* means raise `gpu_memory_utilization`
+(if there's real headroom on `nvidia-smi`); an OOM naming *cache blocks*
+means lower `max_model_len` instead.
+
 ### Env vars
 
 | Var | Default | Meaning |

@@ -27,7 +27,11 @@ module.exports = {
       autorestart: true,
       max_restarts: 10,
       restart_delay: 3000,
-      env: { VLLM_PORT: "8001", VLLM_GPU_MEMORY_UTILIZATION: "0.6" },
+      // VLLM_MAX_MODEL_LEN caps context well below the model's 128K default --
+      // at 128K, vLLM couldn't fit even one KV-cache block in this memory
+      // budget ("No available memory for the cache blocks"). See
+      // scripts/start_vllm.sh and DEPLOYMENT.md's vLLM section.
+      env: { VLLM_PORT: "8001", VLLM_GPU_MEMORY_UTILIZATION: "0.6", VLLM_MAX_MODEL_LEN: "16384" },
     },
   ],
 };
