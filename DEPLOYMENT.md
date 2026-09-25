@@ -269,6 +269,104 @@ load time, ~15-35s) before `/health` reports `model_loaded: true`.
 
 ---
 
+## 9. Video description (vLLM + Qwen2.5-VL)
+
+`POST /extract` also accepts `{"video_url": "..."}`: it samples frames from
+the video and asks a separate, self-hosted Qwen2.5-VL-7B-Instruct model
+(served through vLLM) for a chronological description. This is a genuinely
+separate GPU-resident process from IndicOCR -- `src/api.py` never imports
+`vllm` or loads Qwen itself, it only makes HTTP calls to vLLM's
+OpenAI-compatible API (`VLLM_BASE_URL`, default `http://127.0.0.1:8001/v1`).
+
+### One-time setup
+
+vLLM was found already installed system-wide on this host (`vllm --version`
+→ tied to `/usr/bin/python3`, separate from this project's `.venv` -- no
+dependency conflicts). If it isn't on a fresh box:
+
+```bash
+pip install vllm   # into whatever Python `scripts/start_vllm.sh` will use
+```
+
+`ffmpeg`/`ffprobe` are used via `subprocess` (`src/video/metadata.py`), not
+a Python package -- install at the OS level if missing:
+
+```bash
+sudo apt-get install -y ffmpeg
+```
+
+### Starting it
+
+```bash
+pm2 start ecosystem.config.js   # starts BOTH apps: social-media-ocr-api and vllm-qwen25vl
+```
+
+`scripts/start_vllm.sh` runs:
+
+```bash
+vllm serve Qwen/Qwen2.5-VL-7B-Instruct --port 8001 --gpu-memory-utilization 0.6
+```
+
+First start downloads the model (~16 GB, open on Hugging Face -- no gating,
+unlike IndicOCR) to the same HF cache IndicOCR's model already lives in.
+Poll until ready:
+
+```bash
+curl http://localhost:8001/v1/models   # 200 once loaded
+curl http://localhost:8000/health      # vlm_available: true once the API can reach it
+```
+
+### GPU memory sizing
+
+`--gpu-memory-utilization 0.6` is deliberately well under vLLM's own 0.9
+default. IndicOCR's resident pool holds ~3.7 GB permanently on this box; on
+a 46 GB card, 0.6 (~27.6 GB) comfortably covers a 7B model's weights + KV
+cache while leaving IndicOCR (and headroom for its own request-time spikes)
+untouched. Raise it only after checking `nvidia-smi` for how much both
+processes are actually using, not from the total card size alone.
+
+### Env vars
+
+| Var | Default | Meaning |
+|---|---|---|
+| `VLLM_BASE_URL` | `http://127.0.0.1:8001/v1` | Where `src/api.py` sends chat-completions requests |
+| `VLLM_MODEL` | `Qwen/Qwen2.5-VL-7B-Instruct` | Model name in the API request and in `scripts/start_vllm.sh` |
+| `VLLM_API_KEY` | *(empty)* | Sent as `Authorization: Bearer ...` if set; vLLM's default has no auth |
+| `VLLM_TIMEOUT_SECONDS` | `120` | Per-request timeout for the vLLM call |
+| `MAX_VIDEO_SIZE_MB` | `500` | Rejected with 413 before download completes |
+| `MAX_VIDEO_DURATION_SECONDS` | `3600` | Rejected with 422 after `ffprobe`, before any frame work |
+| `VIDEO_DOWNLOAD_TIMEOUT_SECONDS` | `60` | `video_url` fetch timeout |
+| `FRAME_EXTRACTION_TIMEOUT_SECONDS` | `120` | Caps both `ffprobe` and frame-grabbing per video/chunk |
+| `MAX_CONCURRENT_VIDEO_JOBS` | `1` | Local CPU-side concurrency (download/ffprobe/frame-extract), independent of vLLM's own GPU scheduling |
+
+### Frame sampling policy
+
+| Duration | Frames | | Duration | Frames |
+|---|---:|---|---|---:|
+| 0–10s | 4 | | >2–5min | 12 |
+| >10–30s | 6 | | >5–10min | 16 |
+| >30–60s | 8 | | >10min | chunked: 10-min windows, 16 frames each |
+| >1–2min | 10 | | | |
+
+Frames are centered within evenly-sized slices of the duration
+(`duration * (i + 0.5) / count`), not "first N frames" or fixed-fps, so the
+first/last sample isn't sitting on a blank boundary frame. See
+`src/video/sampler.py` and `tests/test_video.py` for the exact logic and
+its test coverage.
+
+### Security
+
+`video_url` shares `src/media_downloader.py` with `image_url` -- see
+[§7](#7-security-notes-read-before-exposing-this-publicly)'s SSRF note,
+which this module now actually fixes for both: scheme allowlist, DNS
+resolution + rejection of private/loopback/link-local/reserved addresses
+before connecting, and redirects re-validated hop-by-hop rather than
+followed blindly. After download, video is validated with `ffprobe` before
+anything else touches it -- a file that doesn't probe as a real video is
+rejected outright.
+
+---
+
 ## Common operations
 
 ```bash

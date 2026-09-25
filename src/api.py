@@ -1,11 +1,18 @@
-"""Minimal HTTP API around the existing IndicOCR pipeline.
+"""Minimal HTTP API around the existing IndicOCR pipeline, plus video
+description via a self-hosted Qwen2.5-VL model served through vLLM.
 
     uvicorn src.api:app --host 0.0.0.0 --port 8000
 
-One route does the whole job: image in (by URL or base64), extracted content
-out. The OCR pipeline itself (ocr_engine.py / pipeline.py) is untouched --
-this module is pure transport glue, matching the same `process_image()` call
-`run_ocr.py` makes.
+One route does the whole job: image or video in, extracted content out.
+The image path is untouched from before -- image_url/image_base64 still go
+straight through process_image() against the resident IndicOCR pool exactly
+as before (see git history if you need the pre-video diff). video_url is
+new: frames are sampled from the video and sent to a separate vLLM server
+(its own process, its own GPU allocation) for a chronological description.
+The two paths share only this transport layer and the media_downloader's
+safe-fetch logic -- IndicOCR's worker pool and vLLM's model are two
+independent GPU-resident resources, never mixed, never loaded into this
+process.
 
 Requests are served by a pool of OCR_POOL_SIZE independent IndicOCR
 instances (each its own copy of the layout + recognition models, resident
@@ -29,22 +36,23 @@ only if this ever runs across multiple GPUs (one worker per GPU) or the
 recogniser gains a real batched-inference path; on one GPU it will make
 things slower, not faster. See DEPLOYMENT.md's Concurrency section for the
 measurements this is based on.
+
+Video requests are bounded separately by MAX_CONCURRENT_VIDEO_JOBS. vLLM
+does its own request scheduling/batching on the GPU it owns, so this only
+bounds local CPU work (download, ffprobe, frame extraction) -- it is not a
+GPU concurrency control the way OCR_POOL_SIZE is.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import logging
 import os
 import tempfile
-import urllib.request
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-from urllib.error import URLError
-from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -53,9 +61,12 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 
+from . import media_downloader
 from .ocr_engine import OCREngine
 from .pipeline import process_image
 from .preprocess import PreprocessConfig
+from .video_service import VideoProcessingError, describe_video
+from .vlm_client import VLMClient
 
 log = logging.getLogger("ocr.api")
 
@@ -63,13 +74,31 @@ MAX_FETCH_BYTES = 25 * 1024 * 1024   # 25 MB, matches the CLI's own sanity range
 FETCH_TIMEOUT_S = 15
 POOL_SIZE = int(os.environ.get("OCR_POOL_SIZE", "1"))
 
+# --------------------------------------------------------------- video / VLM
+VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8001/v1")
+VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen2.5-VL-7B-Instruct")
+VLLM_API_KEY = os.environ.get("VLLM_API_KEY", "")
+VLLM_TIMEOUT_SECONDS = float(os.environ.get("VLLM_TIMEOUT_SECONDS", "120"))
+
+MAX_VIDEO_SIZE_MB = float(os.environ.get("MAX_VIDEO_SIZE_MB", "500"))
+MAX_VIDEO_SIZE_BYTES = int(MAX_VIDEO_SIZE_MB * 1024 * 1024)
+MAX_VIDEO_DURATION_SECONDS = float(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "3600"))
+VIDEO_DOWNLOAD_TIMEOUT_SECONDS = float(os.environ.get("VIDEO_DOWNLOAD_TIMEOUT_SECONDS", "60"))
+FRAME_EXTRACTION_TIMEOUT_SECONDS = float(os.environ.get("FRAME_EXTRACTION_TIMEOUT_SECONDS", "120"))
+MAX_CONCURRENT_VIDEO_JOBS = int(os.environ.get("MAX_CONCURRENT_VIDEO_JOBS", "1"))
+
 _pool: asyncio.Queue[OCREngine] | None = None
+_video_semaphore: asyncio.Semaphore | None = None
+_vlm_client: VLMClient | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pool
+    global _pool, _video_semaphore, _vlm_client
     _pool = asyncio.Queue()
+    _video_semaphore = asyncio.Semaphore(MAX_CONCURRENT_VIDEO_JOBS)
+    _vlm_client = VLMClient(VLLM_BASE_URL, VLLM_MODEL, VLLM_API_KEY, VLLM_TIMEOUT_SECONDS)
+
     loop = asyncio.get_event_loop()
     log.info("loading %d IndicOCR worker(s) (first run also downloads the "
              "gated model weights)...", POOL_SIZE)
@@ -79,13 +108,17 @@ async def lifespan(app: FastAPI):
         await _pool.put(engine)
         log.info("worker %d/%d ready", i + 1, POOL_SIZE)
     log.info("all %d IndicOCR workers ready", POOL_SIZE)
+    log.info("VLM client configured for %s (model=%s) -- vLLM runs as its "
+             "own process, not loaded here", VLLM_BASE_URL, VLLM_MODEL)
     yield
 
 
 app = FastAPI(
     title="Social Media OCR API",
-    description="Extracts text from social-media poster images via IndicOCR.",
-    version="1.0.0",
+    description="Extracts text from social-media images via IndicOCR, and "
+                "chronological descriptions from videos via a self-hosted "
+                "Qwen2.5-VL model served through vLLM.",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -101,13 +134,16 @@ app.add_middleware(
 class ExtractRequest(BaseModel):
     image_url: str | None = Field(None, description="http(s) URL of the image to fetch.")
     image_base64: str | None = Field(None, description="Raw image bytes, base64-encoded.")
+    video_url: str | None = Field(None, description="http(s) URL of the video to fetch and describe.")
     min_confidence: float = Field(0.0, ge=0.0, le=1.0,
-                                  description="Drop layout blocks scoring below this.")
+                                  description="Drop layout blocks scoring below this (images only).")
 
     @model_validator(mode="after")
     def _exactly_one_source(self) -> "ExtractRequest":
-        if bool(self.image_url) == bool(self.image_base64):
-            raise ValueError("Provide exactly one of image_url or image_base64.")
+        sources = (self.image_url, self.image_base64, self.video_url)
+        if sum(bool(s) for s in sources) != 1:
+            raise ValueError(
+                "Provide exactly one of image_url, image_base64 or video_url.")
         return self
 
 
@@ -122,49 +158,63 @@ class HealthResponse(BaseModel):
     model_loaded: bool
     pool_size: int
     workers_available: int
+    vlm_available: bool
+    vllm_model: str
 
 
 def _fetch_url(url: str) -> bytes:
-    scheme = urlparse(url).scheme
-    if scheme not in ("http", "https"):
-        raise HTTPException(status_code=400, detail=f"Unsupported URL scheme: {scheme!r}")
     try:
-        with urllib.request.urlopen(url, timeout=FETCH_TIMEOUT_S) as resp:
-            data = resp.read(MAX_FETCH_BYTES + 1)
-    except (URLError, TimeoutError, ValueError) as exc:
+        return media_downloader.fetch_url(url, max_bytes=MAX_FETCH_BYTES,
+                                          timeout=FETCH_TIMEOUT_S).data
+    except media_downloader.UnsafeURL as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except media_downloader.PayloadTooLarge as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except media_downloader.FetchFailed as exc:
         raise HTTPException(status_code=422,
                             detail=f"Could not fetch image_url: {exc}") from exc
-    if len(data) > MAX_FETCH_BYTES:
-        raise HTTPException(status_code=413,
-                            detail=f"image_url exceeds {MAX_FETCH_BYTES // (1024*1024)} MB.")
-    if not data:
-        raise HTTPException(status_code=422, detail="image_url returned no content.")
-    return data
 
 
 def _decode_base64(image_base64: str) -> bytes:
     try:
-        data = base64.b64decode(image_base64, validate=True)
-    except binascii.Error as exc:
+        return media_downloader.decode_base64(image_base64, max_bytes=MAX_FETCH_BYTES)
+    except media_downloader.InvalidBase64 as exc:
         raise HTTPException(status_code=400, detail=f"Invalid image_base64: {exc}") from exc
-    if len(data) > MAX_FETCH_BYTES:
-        raise HTTPException(status_code=413,
-                            detail=f"image_base64 exceeds {MAX_FETCH_BYTES // (1024*1024)} MB.")
-    if not data:
-        raise HTTPException(status_code=400, detail="image_base64 decoded to no content.")
-    return data
+    except media_downloader.PayloadTooLarge as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+
+
+def _fetch_video_url(url: str) -> bytes:
+    try:
+        return media_downloader.fetch_url(url, max_bytes=MAX_VIDEO_SIZE_BYTES,
+                                          timeout=VIDEO_DOWNLOAD_TIMEOUT_SECONDS).data
+    except media_downloader.UnsafeURL as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except media_downloader.PayloadTooLarge as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except media_downloader.FetchFailed as exc:
+        raise HTTPException(status_code=422,
+                            detail=f"Could not fetch video_url: {exc}") from exc
 
 
 @app.get("/health", response_model=HealthResponse, tags=["ops"])
 async def health() -> HealthResponse:
+    vlm_ok = await _vlm_client.health() if _vlm_client else False
     return HealthResponse(status="ok", model_loaded=_pool is not None,
                           pool_size=POOL_SIZE,
-                          workers_available=_pool.qsize() if _pool else 0)
+                          workers_available=_pool.qsize() if _pool else 0,
+                          vlm_available=vlm_ok, vllm_model=VLLM_MODEL)
 
 
 @app.post("/extract", response_model=ExtractResponse, tags=["ocr"],
-         summary="Extract text from a social-media image")
+         summary="Extract text from an image, or a description from a video")
 async def extract(request: ExtractRequest) -> ExtractResponse:
+    if request.video_url:
+        return await _extract_video(request.video_url)
+    return await _extract_image(request)
+
+
+async def _extract_image(request: ExtractRequest) -> ExtractResponse:
     image_bytes = _fetch_url(request.image_url) if request.image_url \
         else _decode_base64(request.image_base64)
 
@@ -191,6 +241,27 @@ async def extract(request: ExtractRequest) -> ExtractResponse:
     return ExtractResponse(success=True, data=result.to_dict())
 
 
+async def _extract_video(video_url: str) -> ExtractResponse:
+    t0 = time.perf_counter()
+    video_bytes = _fetch_video_url(video_url)
+    download_time = time.perf_counter() - t0
+
+    async with _video_semaphore:
+        try:
+            data = await describe_video(
+                video_bytes,
+                vlm_client=_vlm_client,
+                max_duration_seconds=MAX_VIDEO_DURATION_SECONDS,
+                frame_extraction_timeout_seconds=FRAME_EXTRACTION_TIMEOUT_SECONDS,
+                download_time_seconds=download_time,
+            )
+        except VideoProcessingError as exc:
+            log.exception("video processing failed")
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return ExtractResponse(success=True, data=data)
+
+
 @app.exception_handler(HTTPException)
 async def http_error_handler(request: Request, exc: HTTPException) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code,
@@ -200,7 +271,7 @@ async def http_error_handler(request: Request, exc: HTTPException) -> JSONRespon
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     """Keep the same {success, error} envelope for request-shape errors too
-    (e.g. neither image_url nor image_base64 given), not FastAPI's default
+    (e.g. no source given, or more than one), not FastAPI's default
     {"detail": [...]} shape -- callers shouldn't need two error formats."""
     message = "; ".join(e["msg"] for e in exc.errors())
     return JSONResponse(status_code=422,
