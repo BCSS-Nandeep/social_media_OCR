@@ -383,6 +383,65 @@ rejected outright.
 
 ---
 
+## 10. Default OCR engine: Qwen2.5-VL (IndicOCR retained as a lazy fallback)
+
+`POST /extract` with `image_url`/`image_base64` now goes to the **same**
+Qwen2.5-VL/vLLM process video descriptions use (`vllm-qwen25vl`), via a
+dedicated OCR prompt in `src/vlm_client.py` (`extract_text`). IndicOCR is
+still in the codebase (`src/ocr_engine.py`, `src/pipeline.py`) but is no
+longer loaded at startup, and no longer the default -- it exists purely as
+an opt-in fallback for when Qwen's call fails.
+
+**Before this change**: `social-media-ocr-api`'s `lifespan()` built and
+warmed `OCR_POOL_SIZE` IndicOCR engines at startup, unconditionally --
+~3.7 GB VRAM, every restart, whether or not a single image request ever
+arrived.
+
+**After**: `lifespan()` does no GPU work at all. `src/ocr_providers.py`'s
+`IndicOCRProvider` is constructed at import time (free -- see its docstring)
+but its actual worker pool is built lazily, only inside `_ensure_pool()`,
+only the first time `.extract()` is called on it. That only happens if
+Qwen's OCR call raises **and** `INDICOCR_FALLBACK_ENABLED=true`. A normal
+deployment where Qwen never fails puts a literal zero bytes of IndicOCR on
+the GPU for the process's entire lifetime.
+
+### Env vars
+
+| Var | Default | Meaning |
+|---|---|---|
+| `OCR_ENGINE` | `qwen` | Informational/reserved -- Qwen is always tried first; this just labels `/health`'s `ocr_engine` field |
+| `INDICOCR_FALLBACK_ENABLED` | `false` | If `true`, a Qwen OCR failure lazily builds and uses the IndicOCR pool instead of returning 422 |
+| `OCR_POOL_SIZE` | `1` | Size of the IndicOCR fallback pool, **if it's ever built** -- irrelevant while fallback never triggers |
+
+### Response compatibility
+
+The response envelope and top-level `data` shape (`image`, `settings`,
+`summary`, `full_text`, `blocks`, `error`) are unchanged so existing clients
+don't need new parsing logic. What changed: Qwen has no per-block detection
+confidence and no bounding boxes, so `confidence` and `bbox_xyxy` are `null`
+on the Qwen path rather than fabricated numbers -- `summary.mean_confidence`
+/ `summary.min_confidence` are `null` too, and `min_confidence` in the
+request has no effect (nothing to filter on). A new top-level `data.engine`
+field (`"qwen"` or `"indicocr"`) says which engine actually produced a given
+response. IndicOCR-path responses are byte-for-byte the same as before this
+change (real confidence, real bboxes) -- that code path is untouched.
+
+### Verifying IndicOCR really isn't loaded
+
+```bash
+nvidia-smi                          # only vllm-qwen25vl's allocation should appear
+curl localhost:8000/health          # {"indicocr_loaded": false, "ocr_engine": "qwen", ...}
+pm2 restart social-media-ocr-api    # restart it
+nvidia-smi                          # same as before the restart -- no new allocation appears
+```
+
+`indicocr_loaded` flips to `true` (and a new `nvidia-smi` allocation
+appears) only after a real fallback has actually fired -- if you see it
+`true` in a deployment where `INDICOCR_FALLBACK_ENABLED=false`, something is
+wrong, since that path should be unreachable.
+
+---
+
 ## Common operations
 
 ```bash

@@ -1,7 +1,7 @@
-"""Offline tests for the HTTP API layer. A fake engine stands in for
-IndicOCR, so these run without model weights, a GPU, or network access --
-and without ever running the real startup lifespan (which would try to
-download the gated model)."""
+"""Offline tests for the HTTP API layer. Qwen (the default OCR/video engine)
+and IndicOCR (the lazy fallback) are both faked here, so these run without
+model weights, a GPU, vLLM, or network access -- and without ever running
+the real startup lifespan."""
 
 from __future__ import annotations
 
@@ -18,15 +18,20 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import src.api as api                       # noqa: E402
-from src import media_downloader             # noqa: E402
+import src.api as api                        # noqa: E402
+from src import media_downloader              # noqa: E402
 from src.ocr_engine import OCREngine, TextBlock  # noqa: E402
-from src.video import frame_extractor        # noqa: E402
+from src.ocr_providers import IndicOCRProvider   # noqa: E402
+from src.video import frame_extractor         # noqa: E402
 from src.video import metadata as video_metadata  # noqa: E402
-from src.vlm_client import VideoDescription  # noqa: E402
+from src.vlm_client import VideoDescription   # noqa: E402
 
 
 class FakeEngine(OCREngine):
+    """Stands in for a real IndicOCR engine wherever the fallback pool would
+    otherwise build one -- see IndicOCRFallbackTests, which patches
+    src.ocr_providers.OCREngine with this class."""
+
     def warmup(self):
         pass
 
@@ -40,20 +45,59 @@ class FailingFakeEngine(FakeEngine):
         raise ValueError("boom")
 
 
-def _pool_of(*engines: OCREngine) -> asyncio.Queue:
-    pool = asyncio.Queue()
-    for engine in engines:
-        pool.put_nowait(engine)
-    return pool
-
-
 def _sample_jpeg_bytes() -> bytes:
     return cv2.imencode(".jpg", np.full((80, 120, 3), 255, np.uint8))[1].tobytes()
 
 
+class FakeQwenProvider:
+    """Stands in for QwenOCRProvider -- the default OCR path. No HTTP call,
+    no GPU, no vLLM."""
+
+    async def extract(self, image_bytes, filename, min_confidence=0.0):
+        return {
+            "engine": "qwen",
+            "image": {"path": None, "name": filename, "width": 120, "height": 80},
+            "settings": {"preprocessing": ["none"]},
+            "summary": {
+                "text_blocks_detected": 1, "mean_confidence": None, "min_confidence": None,
+                "blocks_dropped_below_threshold": 0,
+                "total_processing_time_sec": 0.01,
+                "stage_times_sec": {"ocr": 0.01, "total": 0.01},
+            },
+            "full_text": "HELLO",
+            "blocks": [{"index": 0, "order": 0, "label": "body", "type": "body",
+                       "text": "HELLO", "confidence": None, "bbox_xyxy": None}],
+            "error": None,
+        }
+
+
+class FailingFakeQwenProvider:
+    async def extract(self, image_bytes, filename, min_confidence=0.0):
+        raise RuntimeError("qwen unreachable (simulated)")
+
+
+class FakeVLMClient:
+    """Stands in for a real vLLM server -- no HTTP call, no GPU."""
+
+    async def describe_frames(self, frames):
+        return VideoDescription(
+            description="A person enters the frame and walks across the room.",
+            summary="A person walks across the room.",
+            events=[{"timestamp": frames[0][0], "description": "Person enters frame."}],
+            visible_text=[],
+        )
+
+    async def health(self):
+        return True
+
+
 class ExtractEndpointTests(unittest.TestCase):
+    """Default path: every image request goes to Qwen. IndicOCR is never
+    touched here -- see IndicOCRFallbackTests for that path specifically."""
+
     def setUp(self):
-        api._pool = _pool_of(FakeEngine())  # skips the real lifespan / model download entirely
+        api._qwen_provider = FakeQwenProvider()
+        api._indicocr_provider = IndicOCRProvider(1)   # fresh, unloaded, per test
         self.client = TestClient(api.app)
 
     def test_extract_via_base64_returns_success_envelope(self):
@@ -62,8 +106,21 @@ class ExtractEndpointTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertTrue(body["success"])
+        self.assertEqual(body["data"]["engine"], "qwen")
         self.assertEqual(body["data"]["full_text"], "HELLO")
         self.assertEqual(body["data"]["blocks"][0]["text"], "HELLO")
+
+    def test_qwen_response_does_not_fabricate_confidence_or_bbox(self):
+        payload = {"image_base64": base64.b64encode(_sample_jpeg_bytes()).decode()}
+        resp = self.client.post("/extract", json=payload)
+        block = resp.json()["data"]["blocks"][0]
+        self.assertIn("confidence", block)      # key present for compat...
+        self.assertIsNone(block["confidence"])  # ...but null, never fabricated
+        self.assertIn("bbox_xyxy", block)
+        self.assertIsNone(block["bbox_xyxy"])
+        summary = resp.json()["data"]["summary"]
+        self.assertIsNone(summary["mean_confidence"])
+        self.assertIsNone(summary["min_confidence"])
 
     def test_missing_both_sources_is_rejected(self):
         resp = self.client.post("/extract", json={})
@@ -85,33 +142,13 @@ class ExtractEndpointTests(unittest.TestCase):
         resp = self.client.post("/extract", json={"image_url": "file:///etc/passwd"})
         self.assertEqual(resp.status_code, 400)
 
-    def test_health_reports_model_loaded(self):
+    def test_health_reports_qwen_as_default_and_indicocr_not_loaded(self):
         resp = self.client.get("/health")
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertEqual(body["status"], "ok")
-        self.assertTrue(body["model_loaded"])
-        self.assertEqual(body["workers_available"], 1)
-
-    def test_worker_is_returned_to_pool_after_success(self):
-        payload = {"image_base64": base64.b64encode(_sample_jpeg_bytes()).decode()}
-        self.client.post("/extract", json=payload)
-        self.assertEqual(self.client.get("/health").json()["workers_available"], 1)
-
-    def test_worker_is_returned_to_pool_after_failure(self):
-        api._pool = _pool_of(FailingFakeEngine())
-        payload = {"image_base64": base64.b64encode(_sample_jpeg_bytes()).decode()}
-        resp = self.client.post("/extract", json=payload)
-        self.assertEqual(resp.status_code, 422)
-        self.assertEqual(self.client.get("/health").json()["workers_available"], 1)
-
-    def test_two_requests_share_a_two_worker_pool_without_failing(self):
-        api._pool = _pool_of(FakeEngine(), FakeEngine())
-        payload = {"image_base64": base64.b64encode(_sample_jpeg_bytes()).decode()}
-        for _ in range(2):
-            resp = self.client.post("/extract", json=payload)
-            self.assertEqual(resp.status_code, 200)
-        self.assertEqual(self.client.get("/health").json()["workers_available"], 2)
+        self.assertEqual(body["ocr_engine"], "qwen")
+        self.assertFalse(body["indicocr_loaded"])
 
     def test_root_serves_html(self):
         resp = self.client.get("/")
@@ -120,29 +157,60 @@ class ExtractEndpointTests(unittest.TestCase):
         self.assertIn("IndicOCR", resp.text)
 
 
-class FakeVLMClient:
-    """Stands in for a real vLLM server -- no HTTP call, no GPU."""
+class IndicOCRFallbackTests(unittest.TestCase):
+    """Qwen fails in every test here -- these exist specifically to prove
+    IndicOCR stays dormant unless INDICOCR_FALLBACK_ENABLED is set, and that
+    it's built lazily (only on the call that actually needs it) rather than
+    at startup."""
 
-    async def describe_frames(self, frames):
-        return VideoDescription(
-            description="A person enters the frame and walks across the room.",
-            summary="A person walks across the room.",
-            events=[{"timestamp": frames[0][0], "description": "Person enters frame."}],
-            visible_text=[],
-        )
+    def setUp(self):
+        api._qwen_provider = FailingFakeQwenProvider()
+        api._indicocr_provider = IndicOCRProvider(1)
+        self.client = TestClient(api.app)
 
-    async def health(self):
-        return True
+    def test_fallback_disabled_returns_422_and_indicocr_never_loads(self):
+        payload = {"image_base64": base64.b64encode(_sample_jpeg_bytes()).decode()}
+        with mock.patch.object(api, "INDICOCR_FALLBACK_ENABLED", False):
+            resp = self.client.post("/extract", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertFalse(resp.json()["success"])
+        self.assertFalse(api._indicocr_provider.loaded)
+
+    @mock.patch("src.ocr_providers.OCREngine", FakeEngine)
+    def test_fallback_enabled_lazily_builds_indicocr_and_succeeds(self):
+        payload = {"image_base64": base64.b64encode(_sample_jpeg_bytes()).decode()}
+        self.assertFalse(api._indicocr_provider.loaded)
+        with mock.patch.object(api, "INDICOCR_FALLBACK_ENABLED", True):
+            resp = self.client.post("/extract", json=payload)
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["success"])
+        self.assertEqual(body["data"]["engine"], "indicocr")
+        self.assertEqual(body["data"]["full_text"], "HELLO")
+        self.assertTrue(api._indicocr_provider.loaded)
+
+    @mock.patch("src.ocr_providers.OCREngine", FailingFakeEngine)
+    def test_both_qwen_and_indicocr_failing_returns_422(self):
+        payload = {"image_base64": base64.b64encode(_sample_jpeg_bytes()).decode()}
+        with mock.patch.object(api, "INDICOCR_FALLBACK_ENABLED", True):
+            resp = self.client.post("/extract", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertFalse(resp.json()["success"])
+
+    def test_indicocr_provider_constructor_does_no_gpu_work(self):
+        """Constructing the provider (as happens at module import time) must
+        never touch OCREngine -- only .extract() may."""
+        with mock.patch("src.ocr_providers.OCREngine") as mock_engine_cls:
+            IndicOCRProvider(1)
+            mock_engine_cls.assert_not_called()
 
 
 class VideoEndpointTests(unittest.TestCase):
     """These never touch a real vLLM server or ffmpeg -- video_metadata.probe
     and frame_extractor.extract_frames are mocked at the module level
-    video_service.py imports them from, the same way FakeEngine stands in
-    for OCREngine above."""
+    video_service.py imports them from."""
 
     def setUp(self):
-        api._pool = _pool_of(FakeEngine())
         api._video_semaphore = asyncio.Semaphore(1)
         api._vlm_client = FakeVLMClient()
         self.client = TestClient(api.app)
@@ -240,11 +308,11 @@ class VideoEndpointTests(unittest.TestCase):
 
 
 class ImageOCRRegressionTests(unittest.TestCase):
-    """Confirms the image path is unaffected by the video work sharing the
-    same endpoint and the same media_downloader module."""
+    """Confirms the Qwen image path uses the shared, SSRF-safe downloader
+    exactly like the video path does."""
 
     def setUp(self):
-        api._pool = _pool_of(FakeEngine())
+        api._qwen_provider = FakeQwenProvider()
         self.client = TestClient(api.app)
 
     def test_image_base64_still_works_exactly_as_before(self):
