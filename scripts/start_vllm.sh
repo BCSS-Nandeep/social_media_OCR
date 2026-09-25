@@ -30,7 +30,10 @@ fi
 # generous headroom over the actual usage and leaves real room for the KV
 # cache within the memory budget. Raise it only if a real request needs
 # more context AND `nvidia-smi` shows the room to do it.
-exec vllm serve "${VLLM_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}" \
+#
+# Pinned to the GPU-local NUMA node (see start_api.sh's comment and
+# 'nvidia-smi topo -m') -- same rationale, applies equally to this process.
+exec taskset -c "${GPU_NUMA_CPUS:-0-63,128-191}" vllm serve "${VLLM_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}" \
   --port "${VLLM_PORT:-8001}" \
   --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.6}" \
   --max-model-len "${VLLM_MAX_MODEL_LEN:-16384}"

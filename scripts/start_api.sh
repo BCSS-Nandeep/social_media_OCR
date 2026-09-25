@@ -11,4 +11,9 @@ if [ -f .env ]; then
   set +a
 fi
 
-exec .venv/bin/uvicorn src.api:app --host 0.0.0.0 --port "${PORT:-8000}"
+# Pinned to the NUMA node the GPU is actually attached to (see
+# 'nvidia-smi topo -m' -- GPU0's CPU Affinity row) so CUDA host-side work
+# (pinned memory transfers, IndicOCR pre/post-processing) isn't scheduled
+# onto the far socket and paying cross-NUMA memory latency on every
+# request. Override GPU_NUMA_CPUS if this runs on different hardware.
+exec taskset -c "${GPU_NUMA_CPUS:-0-63,128-191}" .venv/bin/uvicorn src.api:app --host 0.0.0.0 --port "${PORT:-8000}"
