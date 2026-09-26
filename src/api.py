@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -58,7 +59,10 @@ def _configure_logging() -> None:
     if logging.getLogger().handlers:
         return   # already configured (e.g. a second import under --reload)
     level = os.environ.get("LOG_LEVEL", "INFO").upper()
-    handler = logging.StreamHandler()   # stdout -> PM2's own -out.log
+    # Explicit stdout: logging.StreamHandler()'s default is stderr, which
+    # would land everything (including plain INFO lines) in PM2's
+    # -error.log -- misleading when scanning for real failures.
+    handler = logging.StreamHandler(sys.stdout)   # -> PM2's -out.log
     handler.setFormatter(logging.Formatter(
         "%(asctime)s %(levelname)s %(name)s: %(message)s"))
     root = logging.getLogger()
