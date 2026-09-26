@@ -46,9 +46,10 @@ module.exports = {
       // Qwen3-14B-AWQ per explicit request (briefly ran Qwen3-8B-AWQ --
       // reverted). 16384 context (up from the original 4096) needs a bigger
       // absolute budget than 8B did for the same context, since 14B's
-      // larger weights leave less of the budget for KV cache -- 0.38
-      // (~17.5 GB) is a calculated fit against the ~18.2 GB actually free
-      // after Qwen2.5-VL's fixed ~27.8 GB, leaving a small safety margin.
+      // larger weights leave less of the budget for KV cache. 0.38 was
+      // tried first and failed by ~60MB (vLLM's own preflight check said:
+      // "Free memory ... 16.86 GiB ... less than desired ... 16.92 GiB") --
+      // 0.36 (~16.0 GiB) leaves real margin against that measured ceiling.
       // This does NOT touch social-media-ocr-api or vllm-qwen25vl -- if
       // this budget is wrong, only this process fails to start.
       name: "vllm-qwen3-llm",
@@ -62,7 +63,7 @@ module.exports = {
         QWEN3_VLLM_PORT: "8002",
         QWEN3_VLLM_MODEL: "Qwen/Qwen3-14B-AWQ",
         QWEN3_VLLM_SERVED_NAMES: "qwen3:14b-awq Qwen3-14B-AWQ qwen3-14b",
-        QWEN3_VLLM_GPU_MEMORY_UTILIZATION: "0.38",
+        QWEN3_VLLM_GPU_MEMORY_UTILIZATION: "0.36",
         QWEN3_VLLM_MAX_MODEL_LEN: "16384",
         QWEN3_VLLM_MAX_NUM_SEQS: "4",
         QWEN3_VLLM_MAX_NUM_BATCHED_TOKENS: "16384",
