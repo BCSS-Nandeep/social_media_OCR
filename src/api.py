@@ -27,6 +27,7 @@ import asyncio
 import logging
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,29 @@ from .ocr_providers import IndicOCRProvider, QwenOCRProvider
 from .video_service import VideoProcessingError, describe_video
 from .vlm_client import VLMClient
 
+
+def _configure_logging() -> None:
+    """Without this, every log.info()/log.warning() call in this app
+    (including the ones that already existed) is silently dropped -- no
+    handler was ever configured anywhere in the hierarchy, so Python's
+    logging module falls back to its "last resort" handler, which only
+    prints WARNING and above. That meant startup messages never appeared,
+    and the only thing PM2's logs ever showed for a failure was a raw
+    traceback from log.exception (ERROR level clears the WARNING bar) with
+    no surrounding request context. This makes INFO-level request tracing
+    (see extract()) actually visible in `pm2 logs social-media-ocr-api`."""
+    if logging.getLogger().handlers:
+        return   # already configured (e.g. a second import under --reload)
+    level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    handler = logging.StreamHandler()   # stdout -> PM2's own -out.log
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    root.setLevel(level)
+
+
+_configure_logging()
 log = logging.getLogger("ocr.api")
 
 
@@ -193,6 +217,9 @@ def _fetch_video_url(url: str) -> bytes:
 @app.get("/health", response_model=HealthResponse, tags=["ops"])
 async def health() -> HealthResponse:
     vlm_ok = await _vlm_client.health() if _vlm_client else False
+    # DEBUG, not INFO -- monitoring polls this frequently; set LOG_LEVEL=DEBUG
+    # to see these when actually chasing a health-check-specific issue.
+    log.debug("health check vlm_available=%s indicocr_loaded=%s", vlm_ok, _indicocr_provider.loaded)
     return HealthResponse(
         status="ok", model_loaded=vlm_ok,
         pool_size=OCR_POOL_SIZE, workers_available=0,
@@ -204,13 +231,40 @@ async def health() -> HealthResponse:
 
 @app.post("/extract", response_model=ExtractResponse, tags=["ocr"],
          summary="Extract text from an image, or a description from a video")
-async def extract(request: ExtractRequest) -> ExtractResponse:
+async def extract(request: ExtractRequest, http_request: Request) -> ExtractResponse:
+    request_id = uuid.uuid4().hex[:8]
+    client_ip = http_request.client.host if http_request.client else "unknown"
     if request.video_url:
-        return await _extract_video(request.video_url)
-    return await _extract_image(request)
+        media_kind, media_ref = "video_url", request.video_url
+    elif request.image_url:
+        media_kind, media_ref = "image_url", request.image_url
+    else:
+        # Never log the actual base64 payload -- only its length.
+        media_kind = "image_base64"
+        media_ref = f"<{len(request.image_base64 or '')} chars>"
+
+    log.info("[%s] received client=%s media=%s ref=%s",
+             request_id, client_ip, media_kind, media_ref)
+    t0 = time.perf_counter()
+    try:
+        if request.video_url:
+            response = await _extract_video(request.video_url, request_id)
+        else:
+            response = await _extract_image(request, request_id)
+    except HTTPException as exc:
+        elapsed = time.perf_counter() - t0
+        log.warning("[%s] failed status=%d duration=%.3fs error=%s",
+                   request_id, exc.status_code, elapsed, exc.detail)
+        raise
+
+    elapsed = time.perf_counter() - t0
+    engine = (response.data or {}).get("engine") or (response.data or {}).get("media_type", "unknown")
+    log.info("[%s] completed success=%s engine=%s duration=%.3fs",
+             request_id, response.success, engine, elapsed)
+    return response
 
 
-async def _extract_image(request: ExtractRequest) -> ExtractResponse:
+async def _extract_image(request: ExtractRequest, request_id: str = "") -> ExtractResponse:
     image_bytes = _fetch_url(request.image_url) if request.image_url \
         else _decode_base64(request.image_base64)
     filename = "image_url" if request.image_url else "image_base64"
@@ -220,22 +274,22 @@ async def _extract_image(request: ExtractRequest) -> ExtractResponse:
         return ExtractResponse(success=True, data=data)
     except Exception as exc:  # noqa: BLE001 - surfaced as a structured error, not a 500 trace
         if not INDICOCR_FALLBACK_ENABLED:
-            log.exception("Qwen OCR failed (fallback disabled)")
+            log.exception("[%s] Qwen OCR failed (fallback disabled)", request_id)
             raise HTTPException(status_code=422, detail=f"Qwen OCR failed: {exc}") from exc
 
-        log.warning("Qwen OCR failed, falling back to IndicOCR: %s", exc)
+        log.warning("[%s] Qwen OCR failed, falling back to IndicOCR: %s", request_id, exc)
         try:
             data = await _indicocr_provider.extract(image_bytes, filename, request.min_confidence)
             return ExtractResponse(success=True, data=data)
         except Exception as fallback_exc:  # noqa: BLE001
-            log.exception("IndicOCR fallback also failed")
+            log.exception("[%s] IndicOCR fallback also failed", request_id)
             raise HTTPException(
                 status_code=422,
                 detail=f"Qwen OCR failed ({exc}) and IndicOCR fallback also failed: "
                        f"{fallback_exc}") from fallback_exc
 
 
-async def _extract_video(video_url: str) -> ExtractResponse:
+async def _extract_video(video_url: str, request_id: str = "") -> ExtractResponse:
     t0 = time.perf_counter()
     video_bytes = _fetch_video_url(video_url)
     download_time = time.perf_counter() - t0
@@ -250,7 +304,7 @@ async def _extract_video(video_url: str) -> ExtractResponse:
                 download_time_seconds=download_time,
             )
         except VideoProcessingError as exc:
-            log.exception("video processing failed")
+            log.exception("[%s] video processing failed", request_id)
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     return ExtractResponse(success=True, data=data)
@@ -268,6 +322,8 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
     (e.g. no source given, or more than one), not FastAPI's default
     {"detail": [...]} shape -- callers shouldn't need two error formats."""
     message = "; ".join(e["msg"] for e in exc.errors())
+    log.warning("request validation failed client=%s path=%s error=%s",
+               request.client.host if request.client else "unknown", request.url.path, message)
     return JSONResponse(status_code=422,
                         content=ExtractResponse(success=False, error=message).model_dump())
 

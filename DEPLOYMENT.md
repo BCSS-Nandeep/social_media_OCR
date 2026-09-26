@@ -442,6 +442,75 @@ wrong, since that path should be unreachable.
 
 ---
 
+## 11. Logging — reading what actually happened on a request
+
+**Before this section existed, `social-media-ocr-api`'s own log messages
+were invisible.** No logging handler was configured anywhere in the
+process, so Python's logging module fell back to its "last resort" handler,
+which only prints `WARNING` and above to stderr. Every `log.info(...)` call
+in the code (including request tracing added below) was silently dropped —
+`pm2 logs social-media-ocr-api` only ever showed a raw traceback when
+something threw an exception at `ERROR` level, with no context about which
+request caused it, from where, or how long it had been running. That's
+fixed now (`_configure_logging()` in `src/api.py`), but it's worth knowing
+this was the state for everything deployed before this section was written.
+
+### What's logged per request
+
+Every `POST /extract` call gets a short request id (8 hex chars) that
+correlates its "received" and "completed"/"failed" lines:
+
+```
+2026-09-26T10:15:03 INFO ocr.api: [a1b2c3d4] received client=203.0.113.7 media=image_url ref=https://example.com/poster.jpg
+2026-09-26T10:15:05 INFO ocr.api: [a1b2c3d4] completed success=True engine=qwen duration=2.331s
+```
+
+or, on failure:
+
+```
+2026-09-26T10:15:03 INFO ocr.api: [e5f6a7b8] received client=203.0.113.7 media=image_base64 ref=<48213 chars>
+2026-09-26T10:17:03 WARNING ocr.api: [e5f6a7b8] failed status=422 duration=120.014s error=Qwen OCR failed: vLLM request failed: ...ReadTimeout
+```
+
+`image_base64`'s actual content is never logged — only its length — matching
+the same "don't log the payload" principle applied to video work earlier.
+Malformed requests (wrong number of media fields) never reach `extract()`
+at all — FastAPI's own validation rejects them first — so those get a
+single `request validation failed ...` line instead of a request id pair.
+
+### Finding the log level / files
+
+```bash
+pm2 logs social-media-ocr-api              # both streams, tailed live
+pm2 logs social-media-ocr-api --lines 500 --nostream   # last 500 lines, no follow
+cat ~/.pm2/logs/social-media-ocr-api-out.log    # our own log.info/warning lines (stdout)
+cat ~/.pm2/logs/social-media-ocr-api-error.log  # log.exception tracebacks (stderr)
+```
+
+`LOG_LEVEL` (env var, default `INFO`) controls verbosity — set it to
+`DEBUG` to also see `/health` polls (deliberately not logged at `INFO`,
+since monitoring hits that endpoint often). Set it in `.env` or
+`ecosystem.config.js`'s `env` block for `social-media-ocr-api`, same as any
+other var here, then `pm2 restart social-media-ocr-api`.
+
+### Known real incident this surfaced
+
+While reviewing this, 4 occurrences of `httpx.ReadTimeout` were found
+already sitting in the error log — a real image OCR request took longer
+than `VLLM_TIMEOUT_SECONDS` (120s default) to get a response from vLLM at
+port 8001, so it failed with a 422. Normal OCR latency is 1-3s, so this was
+a real anomaly, not expected behavior. The likely cause: **three
+GPU-resident services now share one card** (IndicOCR when it's loaded,
+Qwen2.5-VL, and the separately-deployed Qwen3-14B-AWQ) — this repo's own
+measured finding (§8, Concurrency) is that a single GPU without NVIDIA MPS
+gives CUDA contexts contention, not real parallelism, when more than one is
+active at once. Two independent vLLM processes making genuinely concurrent
+GPU calls is exactly that scenario. If timeouts recur, check whether they
+correlate with Qwen3 traffic (`pm2 logs vllm-qwen3-llm`) before assuming
+vLLM itself is broken.
+
+---
+
 ## Common operations
 
 ```bash
