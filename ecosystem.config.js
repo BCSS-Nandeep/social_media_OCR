@@ -42,12 +42,20 @@ module.exports = {
       env: { VLLM_PORT: "8001", VLLM_GPU_MEMORY_UTILIZATION: "0.6", VLLM_MAX_MODEL_LEN: "16384", GPU_NUMA_CPUS: "0-63,128-191" },
     },
     {
-      // Third GPU-resident process: general-purpose text LLM (Qwen3-14B-AWQ),
-      // separate from the video-description model above. Sized to fit in
-      // whatever's left after IndicOCR + Qwen2.5-VL -- see
-      // scripts/start_vllm_qwen3.sh for the exact memory-fit rationale
-      // (0.28 utilization, 4K context, 4 concurrent sequences; verified
-      // working, do not raise without checking nvidia-smi headroom first).
+      // Third GPU-resident process: general-purpose text LLM. Switched from
+      // Qwen3-14B-AWQ to Qwen3-8B-AWQ -- same family/quantization, much
+      // smaller weights, which is what actually buys the bigger context (see
+      // the 1930 deployment: 14B at 0.97 util supported 16K context; 8B at
+      // 0.85 util -- a SMALLER absolute budget -- supported 32K, because
+      // smaller weights leave proportionally more room for KV cache).
+      //
+      // 0.30 (not 1930's 0.85) is deliberate: this GPU is shared with
+      // Qwen2.5-VL (~27.8 GB) and a dormant IndicOCR fallback (~3.7 GB if it
+      // ever loads) -- gpu-memory-utilization is a fraction of the WHOLE
+      // card, not of what's free, so 0.85 here would ask for ~39 GB against
+      // ~18 GB actually free and fail the same way the Qwen2.5-VL max-model-
+      // len issue did. 0.30 (~13.8 GB) is a measured, conservative fit --
+      // verify with nvidia-smi before raising further.
       name: "vllm-qwen3-llm",
       script: "scripts/start_vllm_qwen3.sh",
       interpreter: "none",
@@ -57,10 +65,12 @@ module.exports = {
       restart_delay: 3000,
       env: {
         QWEN3_VLLM_PORT: "8002",
-        QWEN3_VLLM_GPU_MEMORY_UTILIZATION: "0.28",
-        QWEN3_VLLM_MAX_MODEL_LEN: "4096",
-        QWEN3_VLLM_MAX_NUM_SEQS: "4",
-        QWEN3_VLLM_MAX_NUM_BATCHED_TOKENS: "4096",
+        QWEN3_VLLM_MODEL: "Qwen/Qwen3-8B-AWQ",
+        QWEN3_VLLM_SERVED_NAMES: "qwen3:8b-awq Qwen3-8B-AWQ qwen3-8b",
+        QWEN3_VLLM_GPU_MEMORY_UTILIZATION: "0.30",
+        QWEN3_VLLM_MAX_MODEL_LEN: "32768",
+        QWEN3_VLLM_MAX_NUM_SEQS: "16",
+        QWEN3_VLLM_MAX_NUM_BATCHED_TOKENS: "16384",
         GPU_NUMA_CPUS: "0-63,128-191",
       },
     },
