@@ -1,4 +1,10 @@
-"""End-to-end: image in -> ordered text blocks with confidences out."""
+"""End-to-end: image in -> ordered text blocks with confidences out.
+
+NOT USED BY THE DEPLOYED API SERVICE -- the running service's only OCR path
+is Qwen via vLLM (src/ocr_providers.py's QwenOCRProvider); IndicOCRProvider,
+the class that would call this module from the API, is dead code there.
+Still live for the standalone run_ocr.py CLI tool, which calls this
+directly."""
 
 from __future__ import annotations
 

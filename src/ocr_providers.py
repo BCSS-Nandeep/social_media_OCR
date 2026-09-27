@@ -1,17 +1,24 @@
-"""Two ways to turn an image into text, behind the same small interface.
+"""Two ways to turn an image into text, behind the same small interface --
+only one of which is actually used.
 
-QwenOCRProvider is the default: it costs nothing until the first request
-(it only holds an HTTP client reference) and every call goes to the
-already-running vLLM process -- no model is loaded here.
+QwenOCRProvider is the only engine `src/api.py` calls: it costs nothing
+until the first request (it only holds an HTTP client reference) and every
+call goes to the already-running vLLM process -- no model is loaded here.
 
-IndicOCRProvider exists for one reason: if Qwen ever fails and
-INDICOCR_FALLBACK_ENABLED is set, something still answers the request. It is
-built lazily -- the pool of OCR_POOL_SIZE engines (see engine_pool-style
-warmup in the old api.py) is only constructed the first time `.extract()` is
-actually called, so a normal deployment where Qwen never fails never puts a
-single byte of IndicOCR on the GPU. `OCREngine()` itself is free (see
-ocr_engine.py's `_models` property) -- `warmup()`/`run()` are what actually
-build the model, and this provider is the only thing left that calls them.
+IndicOCRProvider itself is DEAD CODE, kept as a reference implementation
+only. `src/api.py` does not import it, construct it, or call it anywhere,
+under any condition -- there is no fallback in this service. It's left in
+place as a worked example of "how do I plug in another OCR engine behind
+this same interface," not because anything in production depends on it.
+Running it would still work exactly as described below (lazy pool build,
+zero GPU cost until `.extract()` is actually called), but nothing calls
+`.extract()` on this class anymore.
+
+The IndicOCR chain it wraps (ocr_engine.py, pipeline.py, preprocess.py,
+exporter.py) is a separate matter -- those modules are dead to the API
+service too, but NOT dead code overall: run_ocr.py, the standalone CLI
+tool, still calls them directly and works exactly as documented. Only
+IndicOCRProvider (the API-facing wrapper) has zero remaining callers.
 """
 
 from __future__ import annotations
@@ -120,8 +127,10 @@ class QwenOCRProvider:
 
 
 class IndicOCRProvider:
-    """Fallback OCR path, built lazily. Nothing GPU-side happens until the
-    first `.extract()` call actually runs -- see module docstring."""
+    """DEAD CODE -- reference only, not called from src/api.py. See the
+    module docstring. Left functional (lazy pool build, nothing GPU-side
+    until `.extract()` actually runs) as a worked example, not because
+    production depends on it."""
 
     def __init__(self, pool_size: int, warmup: bool = True):
         self._pool_size = max(1, pool_size)

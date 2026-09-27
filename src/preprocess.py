@@ -1,5 +1,11 @@
 """Optional image preprocessing stages.
 
+NOT USED BY THE DEPLOYED API SERVICE -- Qwen (the API's only OCR engine)
+sends raw image bytes with no preprocessing. Still live for the standalone
+run_ocr.py CLI tool and IndicOCR's reference/dead-code path
+(src/ocr_engine.py, src/pipeline.py), which do call this.
+
+
 Every stage is off by default: PaddleOCR's own detector is already trained on
 noisy in-the-wild imagery, and aggressive filtering usually *costs* recall on
 poster art (gradients, thin display fonts, text over photos). Enable a stage

@@ -1,4 +1,9 @@
-"""Result container and TXT / JSON / CSV writers."""
+"""Result container and TXT / JSON / CSV writers.
+
+NOT USED BY THE DEPLOYED API SERVICE -- QwenOCRProvider (src/api.py's only
+OCR path) builds its own response dict directly, not this OCRResult class.
+Still live for the standalone run_ocr.py CLI tool and IndicOCR's
+reference/dead-code path (src/ocr_engine.py, src/pipeline.py)."""
 
 from __future__ import annotations
 

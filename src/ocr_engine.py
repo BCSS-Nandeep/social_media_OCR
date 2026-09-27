@@ -1,5 +1,12 @@
 """IndicOCR wrapper: page image in -> reading-ordered layout blocks out.
 
+NOT USED BY THE DEPLOYED API SERVICE. src/api.py's only OCR engine is Qwen
+via vLLM (src/ocr_providers.py's QwenOCRProvider) -- IndicOCRProvider, the
+class that wraps this module for the API, is dead code there: never
+imported, constructed, or called. This module is still live for the
+standalone run_ocr.py CLI tool, which uses it directly -- it just isn't
+reachable through any HTTP request to the running service.
+
 IndicOCR (Bodhan AI / AI4Bharat, https://huggingface.co/bodhan-ai/indic-ocr)
 is a local, two-stage model: IndicDocLayout detects and orders the page's
 blocks, IndicBlockOCR transcribes them. Script is inferred from the image, so

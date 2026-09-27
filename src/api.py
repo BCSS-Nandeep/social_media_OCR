@@ -8,13 +8,14 @@ model itself. Nothing here (image or video) touches a GPU directly; every
 inference call is an HTTP request to vLLM, which owns the model and does its
 own scheduling/batching.
 
-IndicOCR (src/ocr_engine.py, src/pipeline.py) is kept in the codebase as a
-fallback, not a default: `src/ocr_providers.py`'s IndicOCRProvider builds
-and warms its worker pool lazily, on the FIRST call to it, which only
-happens if Qwen's OCR call raises AND INDICOCR_FALLBACK_ENABLED is set. A
-normal deployment where Qwen never fails never puts a byte of IndicOCR on
-the GPU -- `nvidia-smi` after startup should show only vLLM's allocation.
-See DEPLOYMENT.md for the measured before/after.
+vLLM/Qwen is the ONLY OCR engine used in production -- there is no fallback.
+IndicOCR (src/ocr_engine.py, src/pipeline.py, src/preprocess.py,
+src/exporter.py, and IndicOCRProvider in src/ocr_providers.py) is kept in
+the repository purely as reference/dead code: this module never imports,
+constructs, or calls any of it. A Qwen failure is a failure -- it is
+returned to the caller as a 422, never silently retried against a different
+engine. `nvidia-smi` should always show only vLLM's allocation; IndicOCR
+contributes exactly 0 bytes because nothing here ever touches it.
 
 Video requests are bounded by MAX_CONCURRENT_VIDEO_JOBS -- vLLM does its own
 request scheduling/batching on the GPU it owns, so this only bounds local
@@ -41,7 +42,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 
 from . import media_downloader
-from .ocr_providers import IndicOCRProvider, QwenOCRProvider
+from .ocr_providers import QwenOCRProvider
 from .video_service import VideoProcessingError, describe_video
 from .vlm_client import VLMClient
 
@@ -74,23 +75,12 @@ _configure_logging()
 log = logging.getLogger("ocr.api")
 
 
-def _bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
 MAX_FETCH_BYTES = 25 * 1024 * 1024   # 25 MB, matches the CLI's own sanity range
 FETCH_TIMEOUT_S = 15
 
-# --------------------------------------------------------------- OCR engine
-# OCR_ENGINE is informational/reserved for now: Qwen is always the default
-# and only engine tried first. It exists so /health and logs can say which
-# engine is configured without a second env var to keep in sync.
-OCR_ENGINE = os.environ.get("OCR_ENGINE", "qwen")
-INDICOCR_FALLBACK_ENABLED = _bool("INDICOCR_FALLBACK_ENABLED", False)
-OCR_POOL_SIZE = int(os.environ.get("OCR_POOL_SIZE", "1"))   # fallback pool size, if ever built
+# Fixed, not configurable: Qwen via vLLM is the only engine this service
+# uses. See the module docstring -- IndicOCR is dead code, never wired here.
+OCR_ENGINE = "qwen"
 
 # --------------------------------------------------------------- video / VLM
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8001/v1")
@@ -108,10 +98,6 @@ MAX_CONCURRENT_VIDEO_JOBS = int(os.environ.get("MAX_CONCURRENT_VIDEO_JOBS", "1")
 _video_semaphore: asyncio.Semaphore | None = None
 _vlm_client: VLMClient | None = None
 _qwen_provider: QwenOCRProvider | None = None
-# Constructed eagerly (cheap: no GPU work, see ocr_providers.py), but its
-# internal pool stays None -- and IndicOCR stays off the GPU -- until the
-# first fallback call actually happens.
-_indicocr_provider = IndicOCRProvider(OCR_POOL_SIZE)
 
 
 @asynccontextmanager
@@ -121,11 +107,9 @@ async def lifespan(app: FastAPI):
     _vlm_client = VLMClient(VLLM_BASE_URL, VLLM_MODEL, VLLM_API_KEY, VLLM_TIMEOUT_SECONDS)
     _qwen_provider = QwenOCRProvider(_vlm_client)
 
-    log.info("OCR engine: qwen (default) via %s (model=%s); IndicOCR fallback %s",
-             VLLM_BASE_URL, VLLM_MODEL,
-             "enabled" if INDICOCR_FALLBACK_ENABLED else "disabled")
-    log.info("no GPU model loaded in this process -- vLLM owns the model, "
-             "IndicOCR (if ever used) builds lazily on first fallback")
+    log.info("OCR engine: qwen via %s (model=%s) -- the only engine used; "
+             "no fallback, no other model loaded in this process",
+             VLLM_BASE_URL, VLLM_MODEL)
     yield
 
 
@@ -133,8 +117,7 @@ app = FastAPI(
     title="Social Media OCR API",
     description="Extracts text from social-media images and chronological "
                 "descriptions from videos, both via a self-hosted Qwen2.5-VL "
-                "model served through vLLM. IndicOCR is retained as an "
-                "optional, lazily-loaded fallback for images.",
+                "model served through vLLM.",
     version="2.0.0",
     lifespan=lifespan,
 )
@@ -153,8 +136,9 @@ class ExtractRequest(BaseModel):
     image_base64: str | None = Field(None, description="Raw image bytes, base64-encoded.")
     video_url: str | None = Field(None, description="http(s) URL of the video to fetch and describe.")
     min_confidence: float = Field(0.0, ge=0.0, le=1.0,
-                                  description="IndicOCR-fallback only -- Qwen reports no "
-                                              "per-block confidence to filter on.")
+                                  description="No-op, kept for request-schema compatibility. "
+                                              "Qwen (the only OCR engine) reports no per-block "
+                                              "confidence to filter on.")
 
     @model_validator(mode="after")
     def _exactly_one_source(self) -> "ExtractRequest":
@@ -173,13 +157,11 @@ class ExtractResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
-    model_loaded: bool          # default engine (Qwen/vLLM) reachable
-    pool_size: int              # IndicOCR fallback pool's configured size
-    workers_available: int      # 0 until the fallback pool is actually built
+    model_loaded: bool          # Qwen/vLLM reachable
     vlm_available: bool
     vllm_model: str
-    ocr_engine: str
-    indicocr_loaded: bool
+    ocr_engine: str              # always "qwen"
+    indicocr_loaded: bool        # always False -- IndicOCR is dead code, never invoked
     video_available: bool
 
 
@@ -223,12 +205,11 @@ async def health() -> HealthResponse:
     vlm_ok = await _vlm_client.health() if _vlm_client else False
     # DEBUG, not INFO -- monitoring polls this frequently; set LOG_LEVEL=DEBUG
     # to see these when actually chasing a health-check-specific issue.
-    log.debug("health check vlm_available=%s indicocr_loaded=%s", vlm_ok, _indicocr_provider.loaded)
+    log.debug("health check vlm_available=%s", vlm_ok)
     return HealthResponse(
         status="ok", model_loaded=vlm_ok,
-        pool_size=OCR_POOL_SIZE, workers_available=0,
         vlm_available=vlm_ok, vllm_model=VLLM_MODEL,
-        ocr_engine=OCR_ENGINE, indicocr_loaded=_indicocr_provider.loaded,
+        ocr_engine=OCR_ENGINE, indicocr_loaded=False,
         video_available=vlm_ok,
     )
 
@@ -269,6 +250,7 @@ async def extract(request: ExtractRequest, http_request: Request) -> ExtractResp
 
 
 async def _extract_image(request: ExtractRequest, request_id: str = "") -> ExtractResponse:
+    """Qwen only -- no fallback. See the module docstring for why."""
     image_bytes = _fetch_url(request.image_url) if request.image_url \
         else _decode_base64(request.image_base64)
     filename = "image_url" if request.image_url else "image_base64"
@@ -277,20 +259,8 @@ async def _extract_image(request: ExtractRequest, request_id: str = "") -> Extra
         data = await _qwen_provider.extract(image_bytes, filename, request.min_confidence)
         return ExtractResponse(success=True, data=data)
     except Exception as exc:  # noqa: BLE001 - surfaced as a structured error, not a 500 trace
-        if not INDICOCR_FALLBACK_ENABLED:
-            log.exception("[%s] Qwen OCR failed (fallback disabled)", request_id)
-            raise HTTPException(status_code=422, detail=f"Qwen OCR failed: {exc}") from exc
-
-        log.warning("[%s] Qwen OCR failed, falling back to IndicOCR: %s", request_id, exc)
-        try:
-            data = await _indicocr_provider.extract(image_bytes, filename, request.min_confidence)
-            return ExtractResponse(success=True, data=data)
-        except Exception as fallback_exc:  # noqa: BLE001
-            log.exception("[%s] IndicOCR fallback also failed", request_id)
-            raise HTTPException(
-                status_code=422,
-                detail=f"Qwen OCR failed ({exc}) and IndicOCR fallback also failed: "
-                       f"{fallback_exc}") from fallback_exc
+        log.exception("[%s] Qwen OCR failed", request_id)
+        raise HTTPException(status_code=422, detail=f"Qwen OCR failed: {exc}") from exc
 
 
 async def _extract_video(video_url: str, request_id: str = "") -> ExtractResponse:

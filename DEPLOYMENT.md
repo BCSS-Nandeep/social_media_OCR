@@ -383,48 +383,38 @@ rejected outright.
 
 ---
 
-## 10. Default OCR engine: Qwen2.5-VL (IndicOCR retained as a lazy fallback)
+## 10. OCR engine: Qwen2.5-VL only -- IndicOCR is dead code
 
-`POST /extract` with `image_url`/`image_base64` now goes to the **same**
+`POST /extract` with `image_url`/`image_base64` goes to the **same**
 Qwen2.5-VL/vLLM process video descriptions use (`vllm-qwen25vl`), via a
-dedicated OCR prompt in `src/vlm_client.py` (`extract_text`). IndicOCR is
-still in the codebase (`src/ocr_engine.py`, `src/pipeline.py`) but is no
-longer loaded at startup, and no longer the default -- it exists purely as
-an opt-in fallback for when Qwen's call fails.
+dedicated OCR prompt in `src/vlm_client.py` (`extract_text`). This is the
+**only** OCR engine `social-media-ocr-api` uses -- there is no fallback, no
+config flag that enables one, and no code path in `src/api.py` that ever
+imports, constructs, or calls IndicOCR. A Qwen failure is returned to the
+caller as a 422; it is never silently retried against another engine.
 
-**Before this change**: `social-media-ocr-api`'s `lifespan()` built and
-warmed `OCR_POOL_SIZE` IndicOCR engines at startup, unconditionally --
-~3.7 GB VRAM, every restart, whether or not a single image request ever
-arrived.
+IndicOCR (`src/ocr_engine.py`, `src/pipeline.py`, `src/preprocess.py`,
+`src/exporter.py`, and `IndicOCRProvider` in `src/ocr_providers.py`) stays
+in the repository as reference/dead code -- each module says so in its own
+docstring. It is NOT reachable through the running service under any
+circumstance. It's still functionally live for the standalone `run_ocr.py`
+CLI tool, which calls it directly and is unaffected by any of this.
 
-**After**: `lifespan()` does no GPU work at all. `src/ocr_providers.py`'s
-`IndicOCRProvider` is constructed at import time (free -- see its docstring)
-but its actual worker pool is built lazily, only inside `_ensure_pool()`,
-only the first time `.extract()` is called on it. That only happens if
-Qwen's OCR call raises **and** `INDICOCR_FALLBACK_ENABLED=true`. A normal
-deployment where Qwen never fails puts a literal zero bytes of IndicOCR on
-the GPU for the process's entire lifetime.
-
-### Env vars
-
-| Var | Default | Meaning |
-|---|---|---|
-| `OCR_ENGINE` | `qwen` | Informational/reserved -- Qwen is always tried first; this just labels `/health`'s `ocr_engine` field |
-| `INDICOCR_FALLBACK_ENABLED` | `false` | If `true`, a Qwen OCR failure lazily builds and uses the IndicOCR pool instead of returning 422 |
-| `OCR_POOL_SIZE` | `1` | Size of the IndicOCR fallback pool, **if it's ever built** -- irrelevant while fallback never triggers |
+This was previously an opt-in fallback (`INDICOCR_FALLBACK_ENABLED`,
+`OCR_POOL_SIZE`) -- that wiring has been removed from `src/api.py` entirely,
+not just left disabled by default. If IndicOCR is ever wanted again for the
+API, it needs to be re-wired into `_extract_image()`, not just re-enabled
+via env var.
 
 ### Response compatibility
 
 The response envelope and top-level `data` shape (`image`, `settings`,
 `summary`, `full_text`, `blocks`, `error`) are unchanged so existing clients
-don't need new parsing logic. What changed: Qwen has no per-block detection
-confidence and no bounding boxes, so `confidence` and `bbox_xyxy` are `null`
-on the Qwen path rather than fabricated numbers -- `summary.mean_confidence`
-/ `summary.min_confidence` are `null` too, and `min_confidence` in the
-request has no effect (nothing to filter on). A new top-level `data.engine`
-field (`"qwen"` or `"indicocr"`) says which engine actually produced a given
-response. IndicOCR-path responses are byte-for-byte the same as before this
-change (real confidence, real bboxes) -- that code path is untouched.
+don't need new parsing logic. Qwen has no per-block detection confidence and
+no bounding boxes, so `confidence` and `bbox_xyxy` are `null` rather than
+fabricated numbers -- `summary.mean_confidence`/`summary.min_confidence` are
+`null` too, and `min_confidence` in the request is a documented no-op
+(nothing to filter on). `data.engine` is always `"qwen"`.
 
 ### Verifying IndicOCR really isn't loaded
 
@@ -435,10 +425,9 @@ pm2 restart social-media-ocr-api    # restart it
 nvidia-smi                          # same as before the restart -- no new allocation appears
 ```
 
-`indicocr_loaded` flips to `true` (and a new `nvidia-smi` allocation
-appears) only after a real fallback has actually fired -- if you see it
-`true` in a deployment where `INDICOCR_FALLBACK_ENABLED=false`, something is
-wrong, since that path should be unreachable.
+`indicocr_loaded` is now a hardcoded `false` in the response -- it's not
+reading real state, it's confirming a fact about the code that will stay
+true unless someone re-wires `_extract_image()`.
 
 ---
 

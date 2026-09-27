@@ -44,7 +44,7 @@ the SSH tunnel above)
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/health` | Liveness + which engine is active, whether IndicOCR fallback has ever loaded |
+| `GET` | `/health` | Liveness + confirmation that Qwen is the (only) active engine |
 | `POST` | `/extract` | The one real endpoint — image OCR or video description |
 | `GET` | `/docs` | Swagger UI (auto-generated) |
 | `GET` | `/redoc` | ReDoc UI (auto-generated) |
@@ -61,8 +61,6 @@ curl http://101.53.140.97:8000/health
 {
   "status": "ok",
   "model_loaded": true,
-  "pool_size": 1,
-  "workers_available": 0,
   "vlm_available": true,
   "vllm_model": "Qwen/Qwen2.5-VL-7B-Instruct",
   "ocr_engine": "qwen",
@@ -71,11 +69,11 @@ curl http://101.53.140.97:8000/health
 }
 ```
 
-`ocr_engine`/`vlm_available`/`video_available` describe the default path
-(Qwen via vLLM). `indicocr_loaded` is `false` on a normal deployment —
-IndicOCR only loads if Qwen fails and `INDICOCR_FALLBACK_ENABLED=true` on
-the server; `pool_size`/`workers_available` describe that fallback pool
-specifically, not the default path.
+Qwen (via vLLM) is the **only** OCR/video engine this service uses — there
+is no fallback and no config flag that enables one. `indicocr_loaded` is a
+hardcoded `false`: IndicOCR is kept in the repository as reference/dead
+code (see `DEPLOYMENT.md` §10) but is never reachable through this API
+under any circumstance.
 
 ### `POST /extract`
 
@@ -88,7 +86,7 @@ specifically, not the default path.
 | `image_url` | string | `http(s)` only. Fetched server-side, max 25 MB, SSRF-guarded (private/internal IPs rejected). |
 | `image_base64` | string | Raw image bytes, base64-encoded, no `data:...;base64,` prefix. Max 25 MB decoded. |
 | `video_url` | string | `http(s)` only, same SSRF guard. Max 500 MB, max 3600s (60 min) duration. No `video_base64` — deliberately not implemented, to avoid huge JSON request bodies. |
-| `min_confidence` | number, optional | `0.0`-`1.0`. Only affects the IndicOCR **fallback** path — Qwen reports no per-block confidence to filter on. |
+| `min_confidence` | number, optional | `0.0`-`1.0`. Documented no-op — kept for request-schema compatibility. Qwen (the only OCR engine) reports no per-block confidence to filter on. |
 
 Providing zero or more than one of the three media fields is a `422`.
 
@@ -122,12 +120,9 @@ Providing zero or more than one of the three media fields is a `422`.
 }
 ```
 
-`confidence`/`bbox_xyxy` are `null` on the default (Qwen) path — Qwen
+`confidence`/`bbox_xyxy` are always `null` — Qwen (the only OCR engine)
 doesn't produce a real detection confidence or bounding box, and this
-service never fabricates one. `engine` says which engine actually produced
-the response (`"qwen"` normally, `"indicocr"` only if the fallback fired —
-see `DEPLOYMENT.md` §10). If `engine: "indicocr"` ever appears,
-`confidence`/`bbox_xyxy` are real numbers from IndicDocLayout, not null.
+service never fabricates one. `engine` is always `"qwen"`.
 
 **Video response** (`data`, when the request had `video_url`):
 
@@ -157,7 +152,7 @@ chunks (16 frames each, sequential), combined into one chronological
 |---|---|
 | `400` | Bad request — unsupported scheme, blocked/private IP (SSRF), invalid base64 |
 | `413` | Payload too large |
-| `422` | Well-formed but unprocessable — wrong number of media fields, unreachable URL, undecodable media, duration over the cap, Qwen failure with fallback disabled |
+| `422` | Well-formed but unprocessable — wrong number of media fields, unreachable URL, undecodable media, duration over the cap, or Qwen itself failing (no fallback engine exists) |
 
 ### curl examples
 
@@ -242,7 +237,8 @@ curl http://101.53.140.97:8002/v1/models
 
 All three services share one L40S GPU (46 GB). As of the last check:
 Qwen2.5-VL ≈ 27.8 GB, Qwen3-14B-AWQ ≈ 13.1 GB, ~4.7 GB free, IndicOCR 0 GB
-(loads only if the fallback ever fires). There is no headroom for a fourth
+(dead code — never loaded under any circumstance, no fallback exists).
+There is no headroom for a fourth
 GPU-resident service or for raising any of these models' memory budgets
 without first freeing something — check `nvidia-smi` before changing any of
 `OCR_POOL_SIZE`, `VLLM_GPU_MEMORY_UTILIZATION`, or
