@@ -34,6 +34,7 @@ from .ocr_engine import OCREngine
 from .pipeline import process_image
 from .preprocess import PreprocessConfig
 from .vlm_client import VLMClient, VLMError
+from .vlm_image_prep import downscale_for_vlm
 
 log = logging.getLogger("ocr.providers")
 
@@ -59,20 +60,32 @@ def _sniff_media_type(data: bytes) -> str:
     return "image/jpeg"   # reasonable default; vLLM's decoder is lenient
 
 
-def _image_dimensions(data: bytes) -> tuple[int | None, int | None]:
-    """Best-effort width/height for the response's `image` block -- purely
-    informational, so a decode failure here must not fail the request."""
+def _prepare_for_vlm(data: bytes) -> tuple[bytes, str, int | None, int | None]:
+    """Decode once: downscale if needed (see vlm_image_prep -- an unresized
+    high-res photo can cost the model's entire context budget on its own,
+    same reasoning as the video frame path), and report the dimensions of
+    whatever is actually sent to the model. A decode failure here must not
+    fail the request -- fall back to the original bytes/sniffed media type
+    with unknown dimensions, and let the VLM itself reject it if it truly
+    can't be read."""
     try:
         import cv2
         import numpy as np
         arr = np.frombuffer(data, dtype=np.uint8)
         image = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
         if image is None:
-            return None, None
-        height, width = image.shape[:2]
-        return width, height
-    except Exception:  # noqa: BLE001 - dimensions are a nice-to-have, not load-bearing
-        return None, None
+            return data, _sniff_media_type(data), None, None
+        original_height, original_width = image.shape[:2]
+        resized = downscale_for_vlm(image)
+        if resized is image:
+            return data, _sniff_media_type(data), original_width, original_height
+        ok, buf = cv2.imencode(".jpg", resized)
+        if not ok:
+            return data, _sniff_media_type(data), original_width, original_height
+        height, width = resized.shape[:2]
+        return buf.tobytes(), "image/jpeg", width, height
+    except Exception:  # noqa: BLE001 - resizing is a best-effort optimization
+        return data, _sniff_media_type(data), None, None
 
 
 class QwenOCRProvider:
@@ -84,8 +97,7 @@ class QwenOCRProvider:
     async def extract(self, image_bytes: bytes, filename: str,
                       min_confidence: float = 0.0) -> dict[str, Any]:
         started = time.perf_counter()
-        media_type = _sniff_media_type(image_bytes)
-        width, height = _image_dimensions(image_bytes)
+        image_bytes, media_type, width, height = _prepare_for_vlm(image_bytes)
 
         try:
             result = await self._vlm.extract_text(image_bytes, media_type)

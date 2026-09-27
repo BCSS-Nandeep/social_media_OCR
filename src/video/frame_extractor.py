@@ -13,6 +13,8 @@ from pathlib import Path
 
 import cv2
 
+from ..vlm_image_prep import downscale_for_vlm
+
 
 class FrameExtractionError(RuntimeError):
     """The video could not be opened, or a frame could not be read/encoded
@@ -36,6 +38,7 @@ def extract_frames(path: Path, timestamps: list[float]) -> list[Frame]:
             ok, image = cap.read()
             if not ok or image is None:
                 raise FrameExtractionError(f"Could not read frame at {ts:.2f}s.")
+            image = downscale_for_vlm(image)
             ok, buf = cv2.imencode(".jpg", image)
             if not ok:
                 raise FrameExtractionError(f"Could not encode frame at {ts:.2f}s.")

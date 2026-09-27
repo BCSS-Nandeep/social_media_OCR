@@ -28,6 +28,15 @@ log = logging.getLogger("ocr.vlm")
 
 T = TypeVar("T")
 
+# All 22 scheduled languages of India (Eighth Schedule) plus English. One
+# compact line, not grouped/explained -- every extra token here is duplicated
+# into every OCR and video request this service ever handles, and this text
+# competes with image/frame tokens for the model's fixed context window.
+# Shared once so the OCR and video prompts can't drift apart.
+_INDIAN_SCRIPTS = ("Assamese, Bengali, Bodo, Dogri, English, Gujarati, Hindi, Kannada, "
+                   "Kashmiri, Konkani, Maithili, Malayalam, Manipuri, Marathi, Nepali, "
+                   "Odia, Punjabi, Sanskrit, Santali, Sindhi, Tamil, Telugu, Urdu")
+
 _VIDEO_PROMPT = """You are analyzing a sequence of frames extracted from the same video.
 
 The frames are provided in chronological order.
@@ -37,7 +46,7 @@ Describe what can actually be observed across the video.
 Requirements:
 
 1. Maintain chronological order.
-2. Describe people, actions, objects, locations, vehicles, events, and visible text when relevant.
+2. Describe people, actions, objects, locations, vehicles, events visible in the frames.
 3. Identify meaningful changes between frames.
 4. Do not invent events that cannot be established from the frames.
 5. Do not infer a person's identity unless it is clearly supported by visible information.
@@ -45,10 +54,37 @@ Requirements:
 7. If something is uncertain, explicitly describe it as uncertain.
 8. Avoid repeating the same observation for every frame.
 9. Combine consecutive frames showing the same event into one coherent description.
-10. Mention important text visible in the frames.
-11. Preserve the chronological progression of events.
-12. Focus on useful factual observations rather than generic descriptions such as "this is a video."
-13. Do not hallucinate missing frames or events between sampled frames.
+10. Preserve the chronological progression of events.
+11. Focus on useful factual observations rather than generic descriptions such as "this is a video."
+12. Do not hallucinate missing frames or events between sampled frames.
+13. Do not put any on-screen text into "description", "summary", or "events" -- that
+    belongs only in "visible_text" (see below). Keep the scene narrative and the
+    text transcription strictly separate.
+
+For "visible_text", separately transcribe on-screen text visible in the frames
+(captions, banners, tickers, signage, overlaid headlines) under these rules:
+
+14. Transcribe only text that is actually visible in at least one frame. Never
+    invent, infer, translate, or complete missing text.
+15. Preserve the exact original script the text is written in. It may be
+    English or any Indian script, including all of these:
+""" + _INDIAN_SCRIPTS + """
+    Never substitute characters from a different, visually similar script (for
+    example, do not turn Odia text into Telugu, Bengali, or Hindi, or vice
+    versa, even if two scripts look superficially alike). If a character
+    cannot be confidently identified, omit it rather than guessing a character
+    from another script. The frames may mix more than one language/script in
+    the same text (e.g. an Odia headline with an English hashtag) -- transcribe
+    each part in whichever script it is actually written in; do not force the
+    whole thing into one language.
+16. The same on-screen text commonly repeats across many consecutive frames
+    (e.g. a fixed banner or channel name). Include each distinct piece of visible
+    text ONCE in "visible_text", not once per frame it appears in. If frames show
+    different text at different times, include each distinct piece once, in the
+    order it first appears. If one frame shows the same text more clearly than
+    another, use the clearer/more complete reading.
+17. If no text is visible in any frame, return an empty list, not fabricated text.
+18. Do not translate or summarize the transcribed text -- transcription only.
 
 Return valid JSON only, with exactly this structure:
 
@@ -70,15 +106,29 @@ Rules:
 2. Do not invent, infer, or complete missing text.
 3. Do not describe people, objects, scenery, or photographs.
 4. Extract text embedded inside photographs, posters, graphics, screenshots, banners, memes, and social-media cards.
-5. Preserve the original language.
+5. Preserve the exact original script the text is written in. It may be
+   English or any Indian script, including all of these:
+""" + _INDIAN_SCRIPTS + """
+   Never substitute characters from a different, visually similar script (for
+   example, do not turn Odia text into Telugu, Bengali, or Hindi, or vice
+   versa, even if the two scripts look superficially alike). If a character
+   or word cannot be confidently identified, omit it rather than guessing a
+   character from another script. The image may mix more than one
+   language/script in the same text (e.g. an Odia headline with an English
+   hashtag) -- transcribe each part in whichever script it is actually
+   written in; do not force the whole thing into one language.
 6. Preserve reading order as much as possible.
-7. Support Telugu, Hindi, English, and mixed-language text.
+7. Support text in any language or script equally -- do not favor or default to
+   any particular language.
 8. Do not translate the extracted text.
-9. If text is partially unreadable, do not guess it.
-10. Do not generate captions or descriptions of the image.
-11. Do not treat visual objects as text.
-12. Extract visible text even when it is overlaid on a photograph.
-13. Avoid duplicate text when the same text appears more than once.
+9. If text is partially unreadable, preserve only the readable portion; do not
+   guess the rest.
+10. If there is no readable text anywhere in the image, return an empty
+    "full_text" and an empty "blocks" list -- never fabricate text to fill them.
+11. Do not generate captions or descriptions of the image.
+12. Do not treat visual objects as text.
+13. Extract visible text even when it is overlaid on a photograph.
+14. Avoid duplicate text when the same text appears more than once.
 
 Return valid JSON only, with exactly this structure:
 
