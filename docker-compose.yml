@@ -1,0 +1,87 @@
+version: '3.8'
+
+services:
+  social-media-ocr-api:
+    build: .
+    container_name: social-media-ocr-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - OCR_POOL_SIZE=1
+      # VLLM endpoints for the API
+      - VLLM_BASE_URL=http://vllm-qwen25vl:8001/v1
+    env_file:
+      - .env
+    cpuset: "0-63,128-191"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./data:/app/data
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    ipc: host
+
+  vllm-qwen25vl:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-qwen25vl
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    cpuset: "0-63,128-191"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ipc: host
+    command: >
+      --model Qwen/Qwen2.5-VL-7B-Instruct
+      --port 8001
+      --gpu-memory-utilization 0.6
+      --max-model-len 16384
+
+  vllm-qwen3-llm:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-qwen3-llm
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    env_file:
+      - .env
+    cpuset: "0-63,128-191"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ipc: host
+    command: >
+      --model Qwen/Qwen3-14B-AWQ
+      --served-model-name "qwen3:14b-awq" "Qwen3-14B-AWQ" "qwen3-14b"
+      --port 8002
+      --dtype auto
+      --quantization awq
+      --gpu-memory-utilization 0.36
+      --max-model-len 16384
+      --max-num-seqs 4
+      --max-num-batched-tokens 16384
+      --enable-prefix-caching
+      --kv-cache-dtype fp8
+      --trust-remote-code
+      --enforce-eager
